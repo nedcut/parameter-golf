@@ -85,6 +85,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -733,7 +734,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.use_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    else:
+        import torch._dynamo
+        torch._dynamo.config.disable = True
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -787,10 +792,13 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    try:
+        nvidia_smi_out = subprocess.run(
+            ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
+        ).stdout
+    except FileNotFoundError:
+        nvidia_smi_out = "nvidia-smi not found on PATH\n"
+    log0(nvidia_smi_out, console=False)
     log0("=" * 100, console=False)
 
     # -----------------------------
@@ -908,6 +916,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"use_compile:{args.use_compile}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
