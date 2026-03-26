@@ -1,188 +1,109 @@
 # Parameter Golf Plan
 
-Goal: beat the current baseline (`1.2244 val_bpb`) reliably, then push toward a submission-worthy result without getting lost in premature weirdness.
+Goal: push past the current SOTA (`1.1194 val_bpb`) via quantization-aware training, enabling either better post-quantization quality at the same model size or a larger model in the same 16MB budget.
+
+## Context
+
+- **Challenge**: Best LM in a 16MB artifact, trained in ≤10 min on 8×H100s, scored on FineWeb val BPB
+- **Deadline**: April 30, 2026
+- **Current SOTA**: 1.1194 val_bpb (LeakyReLU² + Legal TTT + Parallel Muon, 3-seed mean)
+- **Naive baseline**: 1.2244 val_bpb (9L 512d, int8+zlib)
+- **Unlimited-compute frontier**: 1.1239 val_bpb (1-bit, 106M params, 2.15 hours)
+
+The leaderboard has been heavily optimized along architecture (11L, XSA, Partial RoPE, BigramHash), training (Muon, EMA, warmdown), and post-training quantization (GPTQ-lite int6). The remaining frontier is **training-time quantization awareness** — making the model learn weight distributions that compress better.
 
 ## Current state
 
-- Repo is at `~/Projects/parameter-golf`
-- Local env works in `.venv`
-- `run.sh` exists for common commands
-- Baseline to beat: `1.2244 val_bpb`
-- Existing unlimited-compute reference: `1.2074 val_bpb`
+- [x] Codebase understood — `train_gpt.py` fully read, all knobs documented in `notes/baseline.md`
+- [x] Leaderboard analyzed — top 5 submissions cross-referenced, ablation tables reviewed
+- [x] **Int4 late-onset QAT implemented** in `train_gpt.py` (Hadamard + trust gradient, QuEST-inspired)
+- [ ] QAT smoke test on GPU (needs CUDA)
+- [ ] Int4 export path (currently QAT trains int4-friendly weights, export still int8+zlib)
+- [ ] First A/B comparison: baseline vs QAT on identical architecture
 
 ## Strategy
 
-We should treat this like a tight engineering loop, not a grand-theory project.
+Two parallel tracks, both building on the QAT infrastructure:
 
-1. **Reproduce and understand the baseline**
-2. **Build a local experiment harness**
-3. **Do cheap ablations first**
-4. **Escalate only the promising ideas to bigger runs**
-5. **Use `autoresearch` as the idea-tracker / experiment-planner, not as the core training repo**
+### Track A — Better quantization at same model size
+- Train with `QAT_BITS=4 QAT_ONSET_SCALE=0.2` on the current 11L/512d architecture
+- Export at int8+zlib (unchanged) and compare val_bpb to non-QAT baseline
+- Hypothesis: QAT-trained weights have tighter distributions → lower post-quantization error → better BPB
+- Low risk, easy to A/B test
 
-## Phase 1 — Baseline reproduction
+### Track B — Larger model via int4 export
+- Add int4+Hadamard export path alongside existing int8
+- Scale up architecture (more layers or wider) to fill the freed bytes
+- Hypothesis: int4 export of QAT-trained model fits ~50% more params in 16MB
+- Higher risk, depends on Track A working first
 
-### Objective
-Get one clean local/remote baseline run and extract the real optimization levers.
+## Implementation plan
 
-### Tasks
-- [ ] Confirm dataset download completed and paths are valid
-- [ ] Run a small local smoke test to verify the full loop
-- [ ] Read `train_gpt.py` closely enough to identify:
-  - model shape knobs
-  - optimizer/schedule knobs
-  - quantization/compression path
-  - logging + validation path
-  - wallclock stop logic
-- [ ] Run one baseline-like single-GPU experiment for sanity
-- [ ] If we use Runpod or another remote box, run one faithful baseline reproduction there
+### Phase 1 — Validate QAT (current)
 
-### Deliverables
-- `notes/baseline.md` or equivalent run notes
-- A table of tunable variables and their expected effect on:
-  - quality
-  - speed
-  - compressed size
+1. **Smoke test** on GPU: run `QAT_BITS=4` for a short run, verify:
+   - No crashes or NaN gradients
+   - `torch.compile` handles the onset recompile
+   - QAT onset logging works
+   - Training speed overhead is acceptable (<15%)
+2. **A/B run**: same architecture, same seed, ±QAT, compare final int8+zlib roundtrip BPB
+3. **Onset sweep**: try `QAT_ONSET_SCALE` in {0.1, 0.2, 0.3, 0.5} to find the compute-optimal onset point
 
-## Phase 2 — Measurement harness
+### Phase 2 — Int4 export path
 
-### Objective
-Make experiments cheap to compare.
+1. Add `quantize_state_dict_int4()` with:
+   - Hadamard pre-rotation of weight matrices before quantizing
+   - Per-row clip search (same as GPTQ-lite but at 4-bit range)
+   - lzma compression
+2. Measure artifact size vs int6 and int8 at the same model size
+3. If artifact is meaningfully smaller, proceed to Phase 3
 
-### Tasks
-- [ ] Create an experiment log format (CSV/JSONL/markdown)
-- [ ] Track at minimum:
-  - run id
-  - code diff / commit
-  - tokenizer
-  - model size / architecture
-  - training tokens seen
-  - wallclock
-  - final `val_loss`
-  - final `val_bpb`
-  - compressed model bytes
-  - total artifact bytes
-- [ ] Add a helper script to snapshot key metrics from stdout/train logs
-- [ ] Separate:
-  - smoke experiments
-  - serious local runs
-  - remote leaderboard-style runs
+### Phase 3 — Scale up the model
 
-### Deliverables
-- `experiments/` or `notes/` folder with structured logs
-- lightweight parser/helper for result extraction
+Candidate architecture changes (pick one or stack):
+- 11L → 14L at same width (512d) — more depth
+- 512d → 640d at same depth (11L) — more width
+- MLP 2× → 3× (if not already at 3×) — wider MLP
+- All of the above combined if int4 frees enough bytes
 
-## Phase 3 — High-probability improvements first
+Run 3-seed evaluation on best config.
 
-These are the first ideas worth testing because they are less deranged than inventing an entirely new architecture on day one.
+### Phase 4 — Stack with SOTA techniques
 
-### 3.1 Architecture-size frontier search
-Goal: find a better point on the quality/compression tradeoff.
+Once the QAT + larger model works, stack on:
+- LeakyReLU(0.5)² (known -0.003 BPB)
+- XSA on last 4 layers
+- EMA + Tight SWA
+- Legal TTT
+- Parameter Banking + Parallel Muon
 
-Try controlled sweeps over:
-- `NUM_LAYERS`
-- `MODEL_DIM`
-- `NUM_HEADS`
-- `NUM_KV_HEADS`
-- `MLP_MULT`
-- tied vs untied embeddings
-- sequence length if allowed by throughput
+This is where we'd create a proper `records/` submission.
 
-Hypothesis:
-- The current 9x512 baseline is probably not Pareto-optimal for compressed artifact size.
-- Small changes in width/depth/head structure may improve bpb at the same compressed size.
+## QAT implementation details
 
-### 3.2 Training schedule / optimizer tuning
-Try:
-- LR and warmup
-- tied embedding LR
-- weight decay
-- batch tokens
-- validation cadence (for instrumentation, not necessarily for final runs)
-- longer runs in non-record mode to identify better configs, then distill back to 10-minute runs
+Added to `train_gpt.py` (1227 lines, under the 1500 cap):
 
-Hypothesis:
-- There is probably free performance in schedule tuning before architecture novelty is required.
+| Component | Description |
+|-----------|-------------|
+| `HadamardTrustQuantizer` | Simulates int-N quantization in forward pass with Hadamard pre-rotation and trust-region gradient masking |
+| `_build_hadamard_block(128)` | Sylvester-construction normalized Hadamard matrix, H²=I |
+| `_hadamard_rotate` | Block-diagonal rotation via reshape+matmul, no full matrix stored |
+| `CastedLinear.wq` | Optional quantizer submodule, created when `qat_bits > 0` |
+| `GPT.set_qat_enabled()` | Toggles all quantizers on/off |
+| Late-onset trigger | In training loop: enables QAT when `lr_scale <= QAT_ONSET_SCALE` |
 
-### 3.3 Quantization/compression-aware tuning
-Inspect exactly how `final_int8_zlib_roundtrip` is computed.
+Env vars: `QAT_BITS` (default 0), `QAT_ONSET_SCALE` (default 0.2), `QAT_BLOCK_SIZE` (default 128)
 
-Try:
-- parameter distributions that compress better
-- regularization that encourages compressibility
-- low-rank / tied / shared weights
-- architectural choices that reduce entropy in final weights
+## Key references
 
-Hypothesis:
-- Since the target metric includes compressed artifact size, boring ML improvements alone may leave score on the table.
-
-## Phase 4 — More aggressive ideas
-
-Only do these after we have a decent harness and a few wins.
-
-### Candidate ideas
-- recurrent depth / repeated blocks with shared weights
-- heavier parameter tying
-- factorized embeddings or low-rank layers
-- tiny latent state + more test-time compute
-- bitnet / constrained-weight experiments
-- alternate tokenizer experiments if the repo rules + measurement story are clean enough
-
-These are attractive, but they can easily become a swamp.
-
-## Collaboration model with `~/Projects/autoresearch`
-
-Use `autoresearch` as the adjacent research notebook/orchestrator repo.
-
-### Good use of `autoresearch`
-- tracking ideas
-- ranking experiments
-- maintaining run summaries
-- synthesizing observations from logs
-- proposing next ablations based on results
-
-### Bad use of `autoresearch`
-- replacing the actual `parameter-golf` training code too early
-- creating a giant meta-framework before we have baseline competence
-
-### Recommended workflow
-1. Run training/code changes in `~/Projects/parameter-golf`
-2. Save results/log summaries
-3. Use `~/Projects/autoresearch` to:
-   - analyze results
-   - propose next experiments
-   - keep a living research agenda
+- **QuEST** (arXiv 2502.05003): Hadamard + trust gradient for stable sub-4-bit QAT
+- **Compute-Optimal QAT** (arXiv 2509.22935): Late-onset QAT during LR cooldown
+- **"Low-Bit Quantization Favors Undertrained LLMs"** (ACL 2025): Aggressive quantization hurts less on undertrained models (relevant since our 10-min runs don't fully converge)
 
 ## Near-term next steps
 
-1. Finish/verify the smoke dataset download
-2. Run a local smoke test end-to-end
-3. Read + annotate `train_gpt.py`
-4. Set up result logging
-5. Do the first 5–10 cheap ablations
-6. Promote the best 1–2 configs to bigger runs
-
-## Success criteria
-
-### Short-term
-- Reproduce baseline behavior cleanly
-- Beat `1.2244` locally or in non-record runs
-
-### Medium-term
-- Find a configuration consistently near or below `1.21`
-- Understand which gains come from:
-  - architecture
-  - schedule
-  - compressibility tricks
-
-### Stretch
-- Produce a clean record-style folder under `records/` with reproducible logs and submission metadata
-
-## My opinionated take
-
-The fastest path to something good is probably:
-- mild architecture sweeps
-- more careful optimization tuning
-- targeted compressibility-aware tweaks
-
-Not “invent a moonshot architecture immediately.” The weird stuff can come after we’ve earned the right to be weird.
+1. Get GPU access (RunPod or similar) for smoke tests
+2. Run QAT smoke test
+3. Run A/B comparison (±QAT, same architecture)
+4. If positive, build int4 export path
+5. If still positive, scale up model and run 3-seed eval

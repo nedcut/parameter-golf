@@ -86,6 +86,12 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Quantization-aware training (late-onset Hadamard int-N QAT).
+    # Set QAT_BITS=4 to enable int4 QAT during warmdown.
+    qat_bits = int(os.environ.get("QAT_BITS", 0))
+    qat_onset_scale = float(os.environ.get("QAT_ONSET_SCALE", 0.2))
+    qat_block_size = int(os.environ.get("QAT_BLOCK_SIZE", 128))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -166,6 +172,61 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
+
+
+# -----------------------------
+# QUANTIZATION-AWARE TRAINING (Hadamard + Trust Gradient)
+# -----------------------------
+#
+# Late-onset QAT: train in full precision, then enable quantization simulation
+# during warmdown so the model learns quantization-friendly weight distributions.
+# Based on QuEST (arXiv 2502.05003) and compute-optimal QAT (arXiv 2509.22935).
+
+_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {
+    1: 0.7979, 2: 1.4935, 3: 2.0511, 4: 2.5139,
+    5: 2.9208, 6: 3.2877, 8: 3.8849,
+}
+
+
+def _build_hadamard_block(size: int) -> Tensor:
+    """Normalized Hadamard matrix via Sylvester construction. Size must be a power of 2."""
+    H = torch.ones(1, 1)
+    while H.shape[0] < size:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return H / math.sqrt(size)
+
+
+def _hadamard_rotate(x: Tensor, H: Tensor) -> Tensor:
+    """Block-diagonal Hadamard rotation along the last dimension."""
+    *batch, dim = x.shape
+    bs = H.shape[0]
+    return (x.reshape(*batch, dim // bs, bs) @ H).reshape(*batch, dim)
+
+
+class HadamardTrustQuantizer(nn.Module):
+    """Simulates low-bit quantization in the forward pass with Hadamard pre-rotation
+    and trust-region gradient masking for stable training at extreme bit widths."""
+
+    def __init__(self, bits: int, block_size: int = 128):
+        super().__init__()
+        self.bits = bits
+        self.n_levels = 2 ** bits - 1
+        self.alpha = _OPTIMAL_GAUSSIAN_SCALES[bits]
+        self.trust = self.alpha / self.n_levels
+        self.enabled = False
+        self.register_buffer("H", _build_hadamard_block(block_size), persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.enabled or not self.training:
+            return x
+        x_h = _hadamard_rotate(x, self.H)
+        std = torch.sqrt(torch.mean(x_h ** 2, dim=-1, keepdim=True)).clamp_min(1e-8)
+        scale = self.alpha * std
+        step = 2 * scale / self.n_levels
+        xq = torch.round(torch.clamp(x_h, -scale, scale) / step) * step
+        mask = (torch.abs(xq - x_h) <= std * self.trust).to(x_h.dtype)
+        out_h = x_h * mask + (xq - x_h * mask).detach()
+        return _hadamard_rotate(out_h, self.H)
 
 
 # -----------------------------
@@ -508,9 +569,21 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # When qat_bits > 0, attaches a Hadamard trust quantizer for QAT simulation.
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 qat_bits: int = 0, qat_block_size: int = 128):
+        super().__init__(in_features, out_features, bias=bias)
+        if qat_bits > 0 and in_features % qat_block_size == 0:
+            self.wq: HadamardTrustQuantizer | None = HadamardTrustQuantizer(qat_bits, qat_block_size)
+        else:
+            self.wq = None
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if self.wq is not None:
+            w = self.wq(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -560,6 +633,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        qat_bits: int = 0,
+        qat_block_size: int = 128,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,10 +647,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_q = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.proj = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -605,11 +680,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, qat_bits: int = 0, qat_block_size: int = 128):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.proj = CastedLinear(hidden, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -626,12 +701,15 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        qat_bits: int = 0,
+        qat_block_size: int = 128,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.mlp = MLP(dim, mlp_mult, qat_bits=qat_bits, qat_block_size=qat_block_size)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +737,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        qat_bits: int = 0,
+        qat_block_size: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,11 +760,14 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    qat_bits=qat_bits,
+                    qat_block_size=qat_block_size,
                 )
                 for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
+        # lm_head is not quantized — small (vocab_size is typically 1024)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -696,6 +779,11 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def set_qat_enabled(self, enabled: bool) -> None:
+        for m in self.modules():
+            if isinstance(m, HadamardTrustQuantizer):
+                m.enabled = enabled
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -835,6 +923,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        qat_bits=args.qat_bits,
+        qat_block_size=args.qat_block_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +998,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.qat_bits > 0:
+        log0(f"qat:configured bits={args.qat_bits} onset_scale={args.qat_onset_scale} block_size={args.qat_block_size}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1006,6 +1098,15 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Late-onset QAT: enable quantization simulation when LR warmdown begins.
+        if args.qat_bits > 0:
+            qat_now = scale <= args.qat_onset_scale
+            base_model.set_qat_enabled(qat_now)
+            if qat_now and step > 0 and not getattr(main, "_qat_logged", False):
+                log0(f"qat:enabled bits={args.qat_bits} onset_scale={args.qat_onset_scale} step={step}")
+                main._qat_logged = True
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
