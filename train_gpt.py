@@ -182,14 +182,38 @@ class Muon(torch.optim.Optimizer):
 # during warmdown so the model learns quantization-friendly weight distributions.
 # Based on QuEST (arXiv 2502.05003) and compute-optimal QAT (arXiv 2509.22935).
 
-_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {
-    1: 0.7979, 2: 1.4935, 3: 2.0511, 4: 2.5139,
-    5: 2.9208, 6: 3.2877, 8: 3.8849,
-}
+_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {4: 2.5139}
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _validate_qat_config(args: Hyperparameters) -> None:
+    if args.qat_bits == 0:
+        return
+    if args.qat_bits not in _OPTIMAL_GAUSSIAN_SCALES:
+        supported = ", ".join(str(bits) for bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
+        raise ValueError(f"QAT_BITS={args.qat_bits} is unsupported; supported values: 0, {supported}")
+    if not _is_power_of_two(args.qat_block_size):
+        raise ValueError(
+            f"QAT_BLOCK_SIZE={args.qat_block_size} must be a positive power of two for Hadamard rotation"
+        )
+    quantized_widths = {
+        "MODEL_DIM": args.model_dim,
+        "MLP_MULT * MODEL_DIM": args.mlp_mult * args.model_dim,
+    }
+    for name, width in quantized_widths.items():
+        if width % args.qat_block_size != 0:
+            raise ValueError(
+                f"{name}={width} must be divisible by QAT_BLOCK_SIZE={args.qat_block_size} when QAT is enabled"
+            )
 
 
 def _build_hadamard_block(size: int) -> Tensor:
     """Normalized Hadamard matrix via Sylvester construction. Size must be a power of 2."""
+    if not _is_power_of_two(size):
+        raise ValueError(f"Hadamard block size must be a positive power of two, got {size}")
     H = torch.ones(1, 1)
     while H.shape[0] < size:
         H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
@@ -205,12 +229,16 @@ def _hadamard_rotate(x: Tensor, H: Tensor) -> Tensor:
 
 class HadamardTrustQuantizer(nn.Module):
     """Simulates low-bit quantization in the forward pass with Hadamard pre-rotation
-    and trust-region gradient masking for stable training at extreme bit widths."""
+    and trust-region gradient masking for stable int4 training."""
 
     def __init__(self, bits: int, block_size: int = 128):
         super().__init__()
         self.bits = bits
-        self.n_levels = 2 ** bits - 1
+        if bits not in _OPTIMAL_GAUSSIAN_SCALES:
+            supported = ", ".join(str(supported_bits) for supported_bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
+            raise ValueError(f"HadamardTrustQuantizer only supports bits in {{{supported}}}, got {bits}")
+        self.qmax = 2 ** (bits - 1) - 1
+        self.n_levels = 2 * self.qmax + 1
         self.alpha = _OPTIMAL_GAUSSIAN_SCALES[bits]
         self.trust = self.alpha / self.n_levels
         self.enabled = False
@@ -222,8 +250,8 @@ class HadamardTrustQuantizer(nn.Module):
         x_h = _hadamard_rotate(x, self.H)
         std = torch.sqrt(torch.mean(x_h ** 2, dim=-1, keepdim=True)).clamp_min(1e-8)
         scale = self.alpha * std
-        step = 2 * scale / self.n_levels
-        xq = torch.round(torch.clamp(x_h, -scale, scale) / step) * step
+        step = scale / self.qmax
+        xq = torch.clamp(torch.round(x_h / step), -self.qmax, self.qmax) * step
         mask = (torch.abs(xq - x_h) <= std * self.trust).to(x_h.dtype)
         out_h = x_h * mask + (xq - x_h * mask).detach()
         return _hadamard_rotate(out_h, self.H)
@@ -573,7 +601,11 @@ class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
                  qat_bits: int = 0, qat_block_size: int = 128):
         super().__init__(in_features, out_features, bias=bias)
-        if qat_bits > 0 and in_features % qat_block_size == 0:
+        if qat_bits > 0:
+            if in_features % qat_block_size != 0:
+                raise ValueError(
+                    f"in_features={in_features} must be divisible by QAT_BLOCK_SIZE={qat_block_size} when QAT is enabled"
+                )
             self.wq: HadamardTrustQuantizer | None = HadamardTrustQuantizer(qat_bits, qat_block_size)
         else:
             self.wq = None
@@ -821,6 +853,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    _validate_qat_config(args)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
