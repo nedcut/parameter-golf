@@ -1,109 +1,135 @@
 # Parameter Golf Plan
 
-Goal: push past the current SOTA (`1.1194 val_bpb`) via quantization-aware training, enabling either better post-quantization quality at the same model size or a larger model in the same 16MB budget.
+Goal: bring this repo to pre-TTT frontier parity, then test int4 late-onset Hadamard/trust-gradient QAT on that stronger stack.
 
 ## Context
 
-- **Challenge**: Best LM in a 16MB artifact, trained in ≤10 min on 8×H100s, scored on FineWeb val BPB
+- **Challenge**: best LM in a 16MB artifact, trained in <=10 minutes on 8xH100s, scored on FineWeb val BPB
 - **Deadline**: April 30, 2026
-- **Current SOTA**: 1.1194 val_bpb (LeakyReLU² + Legal TTT + Parallel Muon, 3-seed mean)
-- **Naive baseline**: 1.2244 val_bpb (9L 512d, int8+zlib)
-- **Unlimited-compute frontier**: 1.1239 val_bpb (1-bit, 106M params, 2.15 hours)
+- **Current 10-minute SOTA**: 1.1194 val_bpb (`LeakyReLU^2 + Legal Score-First TTT + Parallel Muon`, 3-seed mean)
+- **Current pre-TTT stretch target**: ~1.1218 val_bpb from the March 23 record stack before legal TTT
+- **Nearest reproducible codebase checkpoint**: March 22 `11L EMA + GPTQ-lite + warmdown3500 + QAT@0.15` record stack
 
-The leaderboard has been heavily optimized along architecture (11L, XSA, Partial RoPE, BigramHash), training (Muon, EMA, warmdown), and post-training quantization (GPTQ-lite int6). The remaining frontier is **training-time quantization awareness** — making the model learn weight distributions that compress better.
+Late QAT is already part of the public frontier. Our new int4 Hadamard/trust-gradient QAT should be treated as a new ingredient to stack on top of the best pre-TTT recipe, not as the only missing idea.
 
-## Current state
+## Gap Analysis
 
-- [x] Codebase understood — `train_gpt.py` fully read, all knobs documented in `notes/baseline.md`
-- [x] Leaderboard analyzed — top 5 submissions cross-referenced, ablation tables reviewed
-- [x] **Int4 late-onset QAT implemented** in `train_gpt.py` (Hadamard + trust gradient, QuEST-inspired)
-- [ ] QAT smoke test on GPU (needs CUDA)
-- [ ] Int4 export path (currently QAT trains int4-friendly weights, export still int8+zlib)
-- [ ] First A/B comparison: baseline vs QAT on identical architecture
+The top-level `train_gpt.py` remains a strong starter trainer, but it still lacks several frontier ingredients:
 
-## Strategy
+| Area | Starter trainer | Frontier stack | Where to implement |
+|------|-----------------|----------------|--------------------|
+| MLP activation | `relu^2` | `LeakyReLU(0.5)^2` | competitive `records/` path |
+| MLP width | 2x | 3x | competitive `records/` path |
+| Context | 1024 train/eval | 2048 train/eval | competitive `records/` path |
+| Positional setup | full RoPE | partial RoPE 16/64 | competitive `records/` path |
+| Attention tweak | none | XSA on last 4 layers | competitive `records/` path |
+| Token identity features | none | BigramHash + VE128 | competitive `records/` path |
+| Weight averaging | none | EMA + tight SWA | competitive `records/` path |
+| Export path | int8 + zlib | GPTQ-lite int6 + lzma | reusable quant helpers ok, full path in `records/` |
+| Weight decay | none | Muon/Adam weight decay 0.04 | competitive `records/` path |
+| Eval mode | fixed-window | sliding-window stride 64 | competitive `records/` path |
+| Optimizer systems | classic Muon | Parameter Banking + Parallel Muon | later competitive `records/` path |
+| New QAT idea | int4 Hadamard/trust-gradient in starter script | not yet stacked on frontier | shared logic plus competitive `records/` path |
 
-Two parallel tracks, both building on the QAT infrastructure:
+Decision: keep the beginner-oriented top-level trainer mostly stable. Competitive catch-up work should land in a new `records/track_10min_16mb/...` path, except for small reusable utilities that are genuinely shared.
 
-### Track A — Better quantization at same model size
-- Train with `QAT_BITS=4 QAT_ONSET_SCALE=0.2` on the current 11L/512d architecture
-- Export at int8+zlib (unchanged) and compare val_bpb to non-QAT baseline
-- Hypothesis: QAT-trained weights have tighter distributions → lower post-quantization error → better BPB
-- Low risk, easy to A/B test
+## Current State
 
-### Track B — Larger model via int4 export
-- Add int4+Hadamard export path alongside existing int8
-- Scale up architecture (more layers or wider) to fill the freed bytes
-- Hypothesis: int4 export of QAT-trained model fits ~50% more params in 16MB
-- Higher risk, depends on Track A working first
+- [x] Leaderboard snapshot verified against upstream as of March 26, 2026
+- [x] New int4 late-onset Hadamard/trust-gradient QAT implemented and hardened in top-level `train_gpt.py`
+- [x] Internal docs updated to reflect the real frontier
+- [x] New pre-TTT frontier scaffold created under `records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT`
+- [ ] 1-GPU CUDA smoke test on the new frontier scaffold
+- [ ] Pre-TTT parity check against the March 23 stack
+- [ ] Int4-QAT ablation on the parity stack
+- [ ] Int4 export / larger-model follow-up if int4 QAT shows value
+- [ ] Legal score-first TTT after pre-TTT parity is stable
 
-## Implementation plan
+## Roadmap
 
-### Phase 1 — Validate QAT (current)
+### Phase 1 - Pre-TTT Frontier Parity
 
-1. **Smoke test** on GPU: run `QAT_BITS=4` for a short run, verify:
-   - No crashes or NaN gradients
-   - `torch.compile` handles the onset recompile
-   - QAT onset logging works
-   - Training speed overhead is acceptable (<15%)
-2. **A/B run**: same architecture, same seed, ±QAT, compare final int8+zlib roundtrip BPB
-3. **Onset sweep**: try `QAT_ONSET_SCALE` in {0.1, 0.2, 0.3, 0.5} to find the compute-optimal onset point
+Build and validate a reproducible pre-TTT frontier path in a new record-style folder based on the March 22 competitive script, with selected retunes toward the March 23 pre-TTT defaults.
 
-### Phase 2 — Int4 export path
+Target feature set:
 
-1. Add `quantize_state_dict_int4()` with:
-   - Hadamard pre-rotation of weight matrices before quantizing
-   - Per-row clip search (same as GPTQ-lite but at 4-bit range)
-   - lzma compression
-2. Measure artifact size vs int6 and int8 at the same model size
-3. If artifact is meaningfully smaller, proceed to Phase 3
+- 11 layers, 512 width, 8 heads, 4 KV heads
+- 3x MLP with `LeakyReLU(0.5)^2`
+- BigramHash 1536
+- XSA on the last 4 layers
+- partial RoPE 16/64
+- VE128 on layers 9 and 10
+- LN scale
+- EMA(0.997) + tight SWA every 50 steps when LR scale < 0.2
+- warmdown 3500
+- seq_len 2048
+- train batch 786,432 tokens
+- Muon and Adam weight decay 0.04
+- sliding-window eval stride 64
+- GPTQ-lite int6 export with the five March 22 clip percentiles
+- lzma artifact codec
 
-### Phase 3 — Scale up the model
+Checkpoints:
 
-Candidate architecture changes (pick one or stack):
-- 11L → 14L at same width (512d) — more depth
-- 512d → 640d at same depth (11L) — more width
-- MLP 2× → 3× (if not already at 3×) — wider MLP
-- All of the above combined if int4 frees enough bytes
+- base sanity target: a single-seed run should stay near the March 22 baseline behavior (~1.1228 val_bpb)
+- stretch target after the March 23 retunes are fully stacked: approach the March 23 pre-TTT reference (~1.1218 val_bpb)
 
-Run 3-seed evaluation on best config.
+### Phase 2 - Int4-QAT Ablation On The Frontier Stack
 
-### Phase 4 — Stack with SOTA techniques
+Port the new int4 late-onset Hadamard/trust-gradient QAT onto the parity stack.
 
-Once the QAT + larger model works, stack on:
-- LeakyReLU(0.5)² (known -0.003 BPB)
-- XSA on last 4 layers
-- EMA + Tight SWA
-- Legal TTT
-- Parameter Banking + Parallel Muon
+Rules:
 
-This is where we'd create a proper `records/` submission.
+- support `QAT_BITS=4` only
+- require power-of-two `QAT_BLOCK_SIZE`
+- keep fail-fast validation
+- preserve the existing `QAT_BITS`, `QAT_ONSET_SCALE`, and `QAT_BLOCK_SIZE` semantics
+- default `QAT_BITS=0`
+- default onset on the frontier stack: `0.15`
 
-## QAT implementation details
+Experiment matrix:
 
-Added to `train_gpt.py` (1227 lines, under the 1500 cap):
+- `QAT=off` with `QAT_BITS=0 QAT_ENABLED=0 LATE_QAT_THRESHOLD=0`
+- legacy late int6 fake-quant with `QAT_BITS=0 QAT_ENABLED=0 LATE_QAT_THRESHOLD=0.15`
+- new int4 late-onset QAT
+- onset sweep at `0.10`, `0.15`, `0.20`, `0.30`
 
-| Component | Description |
-|-----------|-------------|
-| `HadamardTrustQuantizer` | Simulates int-N quantization in forward pass with Hadamard pre-rotation and trust-region gradient masking |
-| `_build_hadamard_block(128)` | Sylvester-construction normalized Hadamard matrix, H²=I |
-| `_hadamard_rotate` | Block-diagonal rotation via reshape+matmul, no full matrix stored |
-| `CastedLinear.wq` | Optional quantizer submodule, created when `qat_bits > 0` |
-| `GPT.set_qat_enabled()` | Toggles all quantizers on/off |
-| Late-onset trigger | In training loop: enables QAT when `lr_scale <= QAT_ONSET_SCALE` |
+Checkpoint: int4 QAT should either improve mean pre-TTT BPB by at least 0.0005 across 3 seeds or materially improve artifact budget enough to justify a scale-up follow-up.
 
-Env vars: `QAT_BITS` (default 0), `QAT_ONSET_SCALE` (default 0.2), `QAT_BLOCK_SIZE` (default 128)
+### Phase 3 - Int4 Export And Larger Models
 
-## Key references
+Only proceed if Phase 2 is promising.
 
-- **QuEST** (arXiv 2502.05003): Hadamard + trust gradient for stable sub-4-bit QAT
-- **Compute-Optimal QAT** (arXiv 2509.22935): Late-onset QAT during LR cooldown
-- **"Low-Bit Quantization Favors Undertrained LLMs"** (ACL 2025): Aggressive quantization hurts less on undertrained models (relevant since our 10-min runs don't fully converge)
+- add an int4 export path alongside the int6 GPTQ-lite path
+- compare artifact size and roundtrip BPB for int6 vs int4
+- scale depth before width by default, keeping width 512 first because it is the least disruptive change to the established stack
 
-## Near-term next steps
+### Phase 4 - Legal TTT
 
-1. Get GPU access (RunPod or similar) for smoke tests
-2. Run QAT smoke test
-3. Run A/B comparison (±QAT, same architecture)
-4. If positive, build int4 export path
-5. If still positive, scale up model and run 3-seed eval
+After pre-TTT parity and int4-QAT results are stable:
+
+- add legal score-first TTT as a separate layer
+- compare post-TTT results to the March 23 record
+- do not mix TTT into the first catch-up milestone
+
+## Interfaces And Defaults
+
+- Keep the top-level `train_gpt.py` config surface mostly stable.
+- Standardize frontier-only experiments in the new `records/` path around explicit env vars for:
+  - activation choice
+  - XSA depth
+  - RoPE dims
+  - VE layers and dim
+  - EMA and SWA toggles
+  - artifact quantizer and export mode
+  - eval stride
+  - QAT onset and bit settings
+- Treat the March 22 and March 23 record READMEs as the source-of-truth spec for competitive hyperparameters and artifact behavior unless a newer upstream record supersedes them.
+
+## Near-Term Next Steps
+
+1. Run `py_compile` and import-level smoke checks on the new frontier scaffold
+2. Run 1-GPU CUDA smoke jobs for `QAT=off` and `QAT_BITS=4`
+3. Compare the explicit no-QAT control against the March 22 sanity target first, then the March 23 stretch target
+4. Run the int4-QAT onset sweep on the same stack
+5. Only then decide whether to invest in int4 export, larger models, or legal TTT

@@ -1,18 +1,22 @@
-# Baseline notes
+# Starter Trainer vs Frontier Stack
 
-## What `train_gpt.py` actually optimizes
+## What The Top-Level `train_gpt.py` Optimizes
 
-The challenge metric is the post-quantization roundtrip `val_bpb`, not just raw validation loss.
+The challenge metric is post-quantization roundtrip `val_bpb`, not just raw validation loss.
 
 Important consequences:
+
 - model quality matters
 - compressed artifact size matters
 - quantization friendliness matters
-- tiny code changes can matter because code bytes count too
+- code size still matters
 
-## Main knobs discovered in `train_gpt.py`
+The top-level trainer is still a good starting point, but it is intentionally not the current frontier stack.
+
+## Main Knobs In The Starter Trainer
 
 ### Architecture
+
 - `VOCAB_SIZE` (default 1024)
 - `NUM_LAYERS` (default 9)
 - `MODEL_DIM` (default 512)
@@ -24,7 +28,8 @@ Important consequences:
 - `LOGIT_SOFTCAP`
 - `QK_GAIN_INIT`
 
-### Training schedule
+### Training Schedule
+
 - `ITERATIONS` (default 20000)
 - `WARMUP_STEPS` (default 20)
 - `WARMDOWN_ITERS` (default 1200)
@@ -35,6 +40,7 @@ Important consequences:
 - `TRAIN_LOG_EVERY`
 
 ### Optimizer
+
 - `EMBED_LR`
 - `HEAD_LR`
 - `TIED_EMBED_LR`
@@ -47,25 +53,79 @@ Important consequences:
 - `BETA1`, `BETA2`, `ADAM_EPS`
 - `GRAD_CLIP_NORM`
 
-### Quantization / compression
-- per-row int8 for large matrices
-- per-tensor int8 for vectors/scalars
-- small/control tensors preserved in fp16/fp32 passthrough
-- final artifact is `torch.save(...)` of quantized state, then `zlib.compress(..., level=9)`
-- headline metric is logged as:
-  - `final_int8_zlib_roundtrip val_loss:... val_bpb:...`
-  - `final_int8_zlib_roundtrip_exact val_loss:... val_bpb:...`
+### Quantization / Compression
 
-## High-probability levers
+- final artifact: int8 + zlib roundtrip
+- new training-time path: `QAT_BITS=4` late-onset Hadamard/trust-gradient fake quant
+- QAT controls:
+  - `QAT_BITS`
+  - `QAT_ONSET_SCALE`
+  - `QAT_BLOCK_SIZE`
 
-1. **Architecture frontier search**
-   - width/depth/head/GQA tradeoffs likely move both quality and compressibility
-2. **Schedule tuning**
-   - especially learning rates and warmdown under the wallclock cap
-3. **Compressibility-aware tweaks**
-   - weight sharing / tying / lower-entropy parameter distributions
+## Frontier Snapshot As Of March 26, 2026
 
-## Key non-obvious detail
+Current public 10-minute SOTA:
 
-The script requires CUDA and assumes `WORLD_SIZE` divides 8 so gradient accumulation stays integral.
-That means even single-GPU smoke tests should use the CUDA path and preferably `torchrun --standalone --nproc_per_node=1`.
+- `1.1194 val_bpb`
+- March 23 record: `LeakyReLU^2 + Legal Score-First TTT + Parallel Muon`
+
+Current stretch target once the March 23 retunes are fully in place:
+
+- about `1.1218 val_bpb` from the March 23 stack before TTT
+
+Nearest codebase checkpoint to build from:
+
+- March 22 `11L EMA + GPTQ-lite + warmdown3500 + QAT@0.15`
+
+Important nuance:
+
+- the current frontier scaffold starts from the March 22 codebase
+- it already retunes some settings toward March 23, including `LeakyReLU(0.5)^2`, `BIGRAM_VOCAB_SIZE=1536`, and `lzma`
+- it is not yet the full March 23 stack because Parameter Banking + Parallel Muon and legal TTT are still absent
+
+## Starter Trainer vs Frontier Stack
+
+| Area | Starter `train_gpt.py` | Frontier stack | Where it should live |
+|------|------------------------|----------------|----------------------|
+| Core role | readable baseline | competitive record path | keep separate |
+| MLP activation | `relu^2` | `LeakyReLU(0.5)^2` | competitive `records/` path |
+| MLP width | 2x | 3x | competitive `records/` path |
+| Sequence length | 1024 | 2048 | competitive `records/` path |
+| RoPE | full | partial 16/64 | competitive `records/` path |
+| Attention tweak | none | XSA on last 4 layers | competitive `records/` path |
+| Token identity features | none | BigramHash + VE128 | competitive `records/` path |
+| Averaging | none | EMA + tight SWA | competitive `records/` path |
+| Export | int8 + zlib | GPTQ-lite int6 + lzma | competitive `records/` path |
+| Eval | fixed-window | sliding-window stride 64 | competitive `records/` path |
+| Weight decay | none | Muon/Adam WD 0.04 | competitive `records/` path |
+| Optimizer systems | classic Muon | Parameter Banking + Parallel Muon | later competitive `records/` path |
+| New idea | int4 Hadamard/trust-gradient QAT | stack on frontier recipe | shared logic plus competitive `records/` path |
+
+## Working Decision
+
+Do not bloat the beginner-oriented top-level trainer with every frontier-only knob.
+
+Instead:
+
+- keep `train_gpt.py` usable as a starter trainer
+- keep genuinely reusable logic small and isolated
+- land competitive catch-up work in a new `records/track_10min_16mb/...` training path
+
+Current local scaffold for that work:
+
+- `records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT`
+
+## High-Probability Levers From Here
+
+1. Match the March 22 sanity target first, then close the gap toward the March 23 pre-TTT stretch target
+2. Ablate int4 late-onset QAT on that stronger stack
+3. Only then explore int4 export and larger models
+4. Add legal score-first TTT after pre-TTT parity is stable
+
+## Non-Obvious Operational Detail
+
+The CUDA path still assumes `WORLD_SIZE` divides 8 so gradient accumulation stays integral.
+
+That means even single-GPU smoke tests should use:
+
+- `torchrun --standalone --nproc_per_node=1 ...`
