@@ -68,6 +68,14 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    fp16_embed_export = bool(int(os.environ.get("FP16_EMBED_EXPORT", "0")))
+    int6_layer_start = int(os.environ.get("INT6_LAYER_START", "-1"))
+    int6_layer_end = int(os.environ.get("INT6_LAYER_END", "-1"))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_int6 = bool(int(os.environ.get("QAT_INT6", "0")))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))
+    eval_batch_size = int(os.environ.get("EVAL_BATCH_SIZE", "32"))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -85,12 +93,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
-    # Quantization-aware training (late-onset Hadamard int-N QAT).
-    # Set QAT_BITS=4 to enable int4 QAT during warmdown.
-    qat_bits = int(os.environ.get("QAT_BITS", 0))
-    qat_onset_scale = float(os.environ.get("QAT_ONSET_SCALE", 0.2))
-    qat_block_size = int(os.environ.get("QAT_BLOCK_SIZE", 128))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -172,89 +174,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-
-# -----------------------------
-# QUANTIZATION-AWARE TRAINING (Hadamard + Trust Gradient)
-# -----------------------------
-#
-# Late-onset QAT: train in full precision, then enable quantization simulation
-# during warmdown so the model learns quantization-friendly weight distributions.
-# Based on QuEST (arXiv 2502.05003) and compute-optimal QAT (arXiv 2509.22935).
-
-_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {4: 2.5139}
-
-
-def _is_power_of_two(value: int) -> bool:
-    return value > 0 and (value & (value - 1)) == 0
-
-
-def _validate_qat_config(args: Hyperparameters) -> None:
-    if args.qat_bits == 0:
-        return
-    if args.qat_bits not in _OPTIMAL_GAUSSIAN_SCALES:
-        supported = ", ".join(str(bits) for bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
-        raise ValueError(f"QAT_BITS={args.qat_bits} is unsupported; supported values: 0, {supported}")
-    if not _is_power_of_two(args.qat_block_size):
-        raise ValueError(
-            f"QAT_BLOCK_SIZE={args.qat_block_size} must be a positive power of two for Hadamard rotation"
-        )
-    quantized_widths = {
-        "MODEL_DIM": args.model_dim,
-        "MLP_MULT * MODEL_DIM": args.mlp_mult * args.model_dim,
-    }
-    for name, width in quantized_widths.items():
-        if width % args.qat_block_size != 0:
-            raise ValueError(
-                f"{name}={width} must be divisible by QAT_BLOCK_SIZE={args.qat_block_size} when QAT is enabled"
-            )
-
-
-def _build_hadamard_block(size: int) -> Tensor:
-    """Normalized Hadamard matrix via Sylvester construction. Size must be a power of 2."""
-    if not _is_power_of_two(size):
-        raise ValueError(f"Hadamard block size must be a positive power of two, got {size}")
-    H = torch.ones(1, 1)
-    while H.shape[0] < size:
-        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-    return H / math.sqrt(size)
-
-
-def _hadamard_rotate(x: Tensor, H: Tensor) -> Tensor:
-    """Block-diagonal Hadamard rotation along the last dimension."""
-    *batch, dim = x.shape
-    bs = H.shape[0]
-    return (x.reshape(*batch, dim // bs, bs) @ H).reshape(*batch, dim)
-
-
-class HadamardTrustQuantizer(nn.Module):
-    """Simulates low-bit quantization in the forward pass with Hadamard pre-rotation
-    and trust-region gradient masking for stable int4 training."""
-
-    def __init__(self, bits: int, block_size: int = 128):
-        super().__init__()
-        self.bits = bits
-        if bits not in _OPTIMAL_GAUSSIAN_SCALES:
-            supported = ", ".join(str(supported_bits) for supported_bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
-            raise ValueError(f"HadamardTrustQuantizer only supports bits in {{{supported}}}, got {bits}")
-        self.qmax = 2 ** (bits - 1) - 1
-        self.n_levels = 2 * self.qmax + 1
-        self.alpha = _OPTIMAL_GAUSSIAN_SCALES[bits]
-        self.trust = self.alpha / self.n_levels
-        self.enabled = False
-        self.register_buffer("H", _build_hadamard_block(block_size), persistent=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        if not self.enabled or not self.training:
-            return x
-        x_h = _hadamard_rotate(x, self.H)
-        std = torch.sqrt(torch.mean(x_h ** 2, dim=-1, keepdim=True)).clamp_min(1e-8)
-        scale = self.alpha * std
-        step = scale / self.qmax
-        xq = torch.clamp(torch.round(x_h / step), -self.qmax, self.qmax) * step
-        mask = (torch.abs(xq - x_h) <= std * self.trust).to(x_h.dtype)
-        out_h = x_h * mask + (xq - x_h * mask).detach()
-        return _hadamard_rotate(out_h, self.H)
 
 
 # -----------------------------
@@ -428,7 +347,30 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Int6-equivalent: quantize to int8 but round to multiples of 4 (64 levels)."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q_raw = torch.round(clipped / scale[:, None])
+        q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale_val = clip_abs / 127.0 if clip_abs > 0 else 1.0
+    scale = torch.tensor(scale_val, dtype=torch.float32)
+    q_raw = torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale)
+    q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
+    return q, scale
+
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], fp16_embed: bool = False, int6_layer_start: int = -1, int6_layer_end: int = -1):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -465,8 +407,23 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
+        # Keep tied embedding in fp16 for better roundtrip quality
+        if fp16_embed and "tok_emb.weight" in name:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        # Use int6 for middle layers to save space
+        use_int6 = False
+        if int6_layer_start >= 0 and int6_layer_end >= 0:
+            for layer_idx in range(int6_layer_start, int6_layer_end + 1):
+                if f"blocks.{layer_idx}." in name and t.ndim == 2:
+                    use_int6 = True
+                    break
+        q, s = quantize_float_tensor_int6(t) if use_int6 else quantize_float_tensor(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -597,25 +554,25 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # When qat_bits > 0, attaches a Hadamard trust quantizer for QAT simulation.
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 qat_bits: int = 0, qat_block_size: int = 128):
-        super().__init__(in_features, out_features, bias=bias)
-        if qat_bits > 0:
-            if in_features % qat_block_size != 0:
-                raise ValueError(
-                    f"in_features={in_features} must be divisible by QAT_BLOCK_SIZE={qat_block_size} when QAT is enabled"
-                )
-            self.wq: HadamardTrustQuantizer | None = HadamardTrustQuantizer(qat_bits, qat_block_size)
-        else:
-            self.wq = None
+    _qat: bool = False
+    _qat_int6: bool = False
 
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
-        if self.wq is not None:
-            w = self.wq(w)
+        w = self.weight
+        if self._qat and self.training and w.ndim == 2:
+            w_f = w.float()
+            amax = w_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+            scale = amax / 127.0
+            q_raw = (w_f / scale).round()
+            if self._qat_int6:
+                q = (q_raw / 4).round() * 4
+                q = q.clamp(-128, 124)
+            else:
+                q = q_raw.clamp(-127, 127)
+            w_q = q * scale
+            w = w + (w_q - w_f).detach()  # STE
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -665,8 +622,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -679,10 +634,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.proj = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -712,11 +667,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, qat_bits: int = 0, qat_block_size: int = 128):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.proj = CastedLinear(hidden, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -733,15 +688,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.mlp = MLP(dim, mlp_mult, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -769,8 +721,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -792,14 +742,11 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    qat_bits=qat_bits,
-                    qat_block_size=qat_block_size,
                 )
                 for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
-        # lm_head is not quantized — small (vocab_size is typically 1024)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -811,11 +758,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-
-    def set_qat_enabled(self, enabled: bool) -> None:
-        for m in self.modules():
-            if isinstance(m, HadamardTrustQuantizer):
-                m.enabled = enabled
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -844,6 +786,102 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+
+
+def forward_logits(model: nn.Module, input_ids: Tensor) -> Tensor:
+    """Forward pass returning logits (for sliding window eval). Uses uncompiled model."""
+    x = model.tok_emb(input_ids)
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+    for i in range(model.num_encoder_layers):
+        x = model.blocks[i](x, x0)
+        skips.append(x)
+    for i in range(model.num_decoder_layers):
+        if skips:
+            x = x + model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        x = model.blocks[model.num_encoder_layers + i](x, x0)
+    x = model.final_norm(x)
+    if model.tie_embeddings:
+        logits_proj = F.linear(x, model.tok_emb.weight)
+    else:
+        if model.lm_head is None:
+            raise RuntimeError("lm_head is required when tie_embeddings=False")
+        logits_proj = model.lm_head(x)
+    return model.logit_softcap * torch.tanh(logits_proj / model.logit_softcap)
+
+
+def eval_val_sliding(
+    args: "Hyperparameters",
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Sliding window evaluation for better BPB."""
+    seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    stride = args.eval_stride if args.eval_stride > 0 else seq_len
+    batch_size = args.eval_batch_size
+    total_len = val_tokens.numel()
+
+    # Generate window start positions
+    positions = list(range(0, total_len - seq_len, stride))
+    # Distribute across ranks (interleaved for balance)
+    rank_positions = positions[rank::world_size]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for batch_start in range(0, len(rank_positions), batch_size):
+            batch_pos = rank_positions[batch_start : batch_start + batch_size]
+            bs = len(batch_pos)
+
+            x = torch.stack(
+                [val_tokens[p : p + seq_len] for p in batch_pos]
+            ).to(device=device, dtype=torch.int64)
+            y = torch.stack(
+                [val_tokens[p + 1 : p + seq_len + 1] for p in batch_pos]
+            ).to(device=device, dtype=torch.int64)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = forward_logits(base_model, x)  # [bs, seq_len, vocab]
+
+            # Score only the last stride tokens of each window
+            score_start = seq_len - stride
+            logits_s = logits[:, score_start:, :].float()
+            targets_s = y[:, score_start:]
+
+            per_tok = F.cross_entropy(
+                logits_s.reshape(-1, logits_s.size(-1)),
+                targets_s.reshape(-1),
+                reduction="none",
+            )
+            loss_sum += per_tok.to(torch.float64).sum()
+            token_count += float(targets_s.numel())
+
+            prev_ids = x[:, score_start:].reshape(-1)
+            tgt_ids = targets_s.reshape(-1)
+            tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+            byte_count += tb.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    return val_loss, float(bits_per_token * tokens_per_byte)
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -853,7 +891,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    _validate_qat_config(args)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -956,13 +993,16 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        qat_bits=args.qat_bits,
-        qat_block_size=args.qat_block_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.qat_enabled:
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module._qat = True
+                module._qat_int6 = args.qat_int6
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1031,8 +1071,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.qat_bits > 0:
-        log0(f"qat:configured bits={args.qat_bits} onset_scale={args.qat_onset_scale} block_size={args.qat_block_size}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1131,15 +1169,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-
-        # Late-onset QAT: enable quantization simulation when LR warmdown begins.
-        if args.qat_bits > 0:
-            qat_now = scale <= args.qat_onset_scale
-            base_model.set_qat_enabled(qat_now)
-            if qat_now and step > 0 and not getattr(main, "_qat_logged", False):
-                log0(f"qat:enabled bits={args.qat_bits} onset_scale={args.qat_onset_scale} step={step}")
-                main._qat_logged = True
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1207,7 +1236,12 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(
+        base_model.state_dict(),
+        fp16_embed=args.fp16_embed_export if args.tie_embeddings else False,
+        int6_layer_start=args.int6_layer_start,
+        int6_layer_end=args.int6_layer_end,
+    )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1252,9 +1286,146 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
+    if args.eval_stride > 0:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"stride:{args.eval_stride} seq_len:{args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
     if distributed:
         dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]
+Running PyTorch 2.9.1+cu128
+Thu Mar 19 17:34:18 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:18:00.0 Off |                    0 |
+| N/A   26C    P0            116W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:2A:00.0 Off |                    0 |
+| N/A   27C    P0            114W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:3A:00.0 Off |                    0 |
+| N/A   29C    P0            122W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:5D:00.0 Off |                    0 |
+| N/A   25C    P0            116W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:9A:00.0 Off |                    0 |
+| N/A   25C    P0            113W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:AB:00.0 Off |                    0 |
+| N/A   28C    P0            119W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:BA:00.0 Off |                    0 |
+| N/A   26C    P0            116W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:DB:00.0 Off |                    0 |
+| N/A   24C    P0            117W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A           29912      C   /usr/local/bin/python                  1510MiB |
+|    1   N/A  N/A           29913      C   /usr/local/bin/python                  1510MiB |
+|    2   N/A  N/A           29914      C   /usr/local/bin/python                  1510MiB |
+|    3   N/A  N/A           29915      C   /usr/local/bin/python                  1510MiB |
+|    4   N/A  N/A           29916      C   /usr/local/bin/python                  1510MiB |
+|    5   N/A  N/A           29917      C   /usr/local/bin/python                  1510MiB |
+|    6   N/A  N/A           29918      C   /usr/local/bin/python                  1510MiB |
+|    7   N/A  N/A           29919      C   /usr/local/bin/python                  1510MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:21778504
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 matrix_lr:0.02 scalar_lr:0.02
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9378 val_bpb:4.1090 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:6.9364 train_time:33ms step_avg:33.19ms
+step:2/20000 train_loss:12.3383 train_time:81ms step_avg:40.53ms
+step:3/20000 train_loss:7.4163 train_time:130ms step_avg:43.28ms
+step:4/20000 train_loss:6.3475 train_time:180ms step_avg:44.88ms
+step:5/20000 train_loss:6.7813 train_time:228ms step_avg:45.56ms
+step:6/20000 train_loss:7.4845 train_time:276ms step_avg:46.04ms
+step:7/20000 train_loss:6.7421 train_time:326ms step_avg:46.51ms
+step:8/20000 train_loss:6.4367 train_time:374ms step_avg:46.72ms
+step:9/20000 train_loss:6.2890 train_time:422ms step_avg:46.92ms
+step:10/20000 train_loss:6.1643 train_time:473ms step_avg:47.26ms
+step:2000/20000 train_loss:2.2222 train_time:97250ms step_avg:48.62ms
+step:4000/20000 train_loss:2.1321 train_time:194489ms step_avg:48.62ms
+step:6000/20000 train_loss:2.1823 train_time:292006ms step_avg:48.67ms
+step:6000/20000 val_loss:2.1045 val_bpb:1.2464 train_time:292027ms step_avg:48.67ms
+step:8000/20000 train_loss:2.0748 train_time:389371ms step_avg:48.67ms
+step:10000/20000 train_loss:2.0717 train_time:486716ms step_avg:48.67ms
+step:12000/20000 train_loss:2.0082 train_time:583997ms step_avg:48.67ms
+step:12000/20000 val_loss:2.0352 val_bpb:1.2053 train_time:584011ms step_avg:48.67ms
+step:12329/20000 val_loss:2.0273 val_bpb:1.2007 train_time:600040ms step_avg:48.67ms
+stopping_early: wallclock_cap train_time:600040ms step:12329/20000
+peak memory allocated: 11188 MiB reserved: 11490 MiB
+Serialized model: 86099351 bytes
+Code size: 55752 bytes
+Total submission size: 86155103 bytes
+Serialized model int8+zlib: 15637847 bytes (payload:22428960 raw_torch:22473755 payload_ratio:3.84x)
+Total submission size int8+zlib: 15693599 bytes
+final_int8_zlib_roundtrip val_loss:2.0258 val_bpb:1.1998 eval_time:1670ms
+final_int8_zlib_roundtrip_exact val_loss:2.02579640 val_bpb:1.19979073
+final_sliding_window val_loss:1.9698 val_bpb:1.1666 stride:64 seq_len:1024 eval_time:72611ms
+final_sliding_window_exact val_loss:1.96976839 val_bpb:1.16660881

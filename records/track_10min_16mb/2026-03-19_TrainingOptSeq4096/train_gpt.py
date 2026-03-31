@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -30,11 +30,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
+# Default Training Opt Seq4096 v1 run:
 # - 9 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# - vocab size 1024, sequence length 4096, tied embeddings
+# - 393,216 train tokens per step (3/4 batch) for 20,000 iterations with a ~10 minute cap
+# - tuned Muon optimizer: momentum 0.99, lower LR (0.020/0.020/0.030), warmdown 3000
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -42,7 +43,7 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", "training_opt_seq4096_v1")
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -52,10 +53,10 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -73,24 +74,18 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.030))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.020))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.020))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
-    # Quantization-aware training (late-onset Hadamard int-N QAT).
-    # Set QAT_BITS=4 to enable int4 QAT during warmdown.
-    qat_bits = int(os.environ.get("QAT_BITS", 0))
-    qat_onset_scale = float(os.environ.get("QAT_ONSET_SCALE", 0.2))
-    qat_block_size = int(os.environ.get("QAT_BLOCK_SIZE", 128))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -172,89 +167,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-
-# -----------------------------
-# QUANTIZATION-AWARE TRAINING (Hadamard + Trust Gradient)
-# -----------------------------
-#
-# Late-onset QAT: train in full precision, then enable quantization simulation
-# during warmdown so the model learns quantization-friendly weight distributions.
-# Based on QuEST (arXiv 2502.05003) and compute-optimal QAT (arXiv 2509.22935).
-
-_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {4: 2.5139}
-
-
-def _is_power_of_two(value: int) -> bool:
-    return value > 0 and (value & (value - 1)) == 0
-
-
-def _validate_qat_config(args: Hyperparameters) -> None:
-    if args.qat_bits == 0:
-        return
-    if args.qat_bits not in _OPTIMAL_GAUSSIAN_SCALES:
-        supported = ", ".join(str(bits) for bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
-        raise ValueError(f"QAT_BITS={args.qat_bits} is unsupported; supported values: 0, {supported}")
-    if not _is_power_of_two(args.qat_block_size):
-        raise ValueError(
-            f"QAT_BLOCK_SIZE={args.qat_block_size} must be a positive power of two for Hadamard rotation"
-        )
-    quantized_widths = {
-        "MODEL_DIM": args.model_dim,
-        "MLP_MULT * MODEL_DIM": args.mlp_mult * args.model_dim,
-    }
-    for name, width in quantized_widths.items():
-        if width % args.qat_block_size != 0:
-            raise ValueError(
-                f"{name}={width} must be divisible by QAT_BLOCK_SIZE={args.qat_block_size} when QAT is enabled"
-            )
-
-
-def _build_hadamard_block(size: int) -> Tensor:
-    """Normalized Hadamard matrix via Sylvester construction. Size must be a power of 2."""
-    if not _is_power_of_two(size):
-        raise ValueError(f"Hadamard block size must be a positive power of two, got {size}")
-    H = torch.ones(1, 1)
-    while H.shape[0] < size:
-        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-    return H / math.sqrt(size)
-
-
-def _hadamard_rotate(x: Tensor, H: Tensor) -> Tensor:
-    """Block-diagonal Hadamard rotation along the last dimension."""
-    *batch, dim = x.shape
-    bs = H.shape[0]
-    return (x.reshape(*batch, dim // bs, bs) @ H).reshape(*batch, dim)
-
-
-class HadamardTrustQuantizer(nn.Module):
-    """Simulates low-bit quantization in the forward pass with Hadamard pre-rotation
-    and trust-region gradient masking for stable int4 training."""
-
-    def __init__(self, bits: int, block_size: int = 128):
-        super().__init__()
-        self.bits = bits
-        if bits not in _OPTIMAL_GAUSSIAN_SCALES:
-            supported = ", ".join(str(supported_bits) for supported_bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
-            raise ValueError(f"HadamardTrustQuantizer only supports bits in {{{supported}}}, got {bits}")
-        self.qmax = 2 ** (bits - 1) - 1
-        self.n_levels = 2 * self.qmax + 1
-        self.alpha = _OPTIMAL_GAUSSIAN_SCALES[bits]
-        self.trust = self.alpha / self.n_levels
-        self.enabled = False
-        self.register_buffer("H", _build_hadamard_block(block_size), persistent=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        if not self.enabled or not self.training:
-            return x
-        x_h = _hadamard_rotate(x, self.H)
-        std = torch.sqrt(torch.mean(x_h ** 2, dim=-1, keepdim=True)).clamp_min(1e-8)
-        scale = self.alpha * std
-        step = scale / self.qmax
-        xq = torch.clamp(torch.round(x_h / step), -self.qmax, self.qmax) * step
-        mask = (torch.abs(xq - x_h) <= std * self.trust).to(x_h.dtype)
-        out_h = x_h * mask + (xq - x_h * mask).detach()
-        return _hadamard_rotate(out_h, self.H)
 
 
 # -----------------------------
@@ -597,25 +509,9 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # When qat_bits > 0, attaches a Hadamard trust quantizer for QAT simulation.
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 qat_bits: int = 0, qat_block_size: int = 128):
-        super().__init__(in_features, out_features, bias=bias)
-        if qat_bits > 0:
-            if in_features % qat_block_size != 0:
-                raise ValueError(
-                    f"in_features={in_features} must be divisible by QAT_BLOCK_SIZE={qat_block_size} when QAT is enabled"
-                )
-            self.wq: HadamardTrustQuantizer | None = HadamardTrustQuantizer(qat_bits, qat_block_size)
-        else:
-            self.wq = None
-
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
-        if self.wq is not None:
-            w = self.wq(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -665,8 +561,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -679,10 +573,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.proj = CastedLinear(dim, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -712,11 +606,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, qat_bits: int = 0, qat_block_size: int = 128):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.proj = CastedLinear(hidden, dim, bias=False, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -733,15 +627,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        qat_bits=qat_bits, qat_block_size=qat_block_size)
-        self.mlp = MLP(dim, mlp_mult, qat_bits=qat_bits, qat_block_size=qat_block_size)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -769,8 +660,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        qat_bits: int = 0,
-        qat_block_size: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -792,14 +681,11 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    qat_bits=qat_bits,
-                    qat_block_size=qat_block_size,
                 )
                 for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
-        # lm_head is not quantized — small (vocab_size is typically 1024)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -811,11 +697,6 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-
-    def set_qat_enabled(self, enabled: bool) -> None:
-        for m in self.modules():
-            if isinstance(m, HadamardTrustQuantizer):
-                m.enabled = enabled
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -853,7 +734,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    _validate_qat_config(args)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -956,8 +836,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        qat_bits=args.qat_bits,
-        qat_block_size=args.qat_block_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1031,8 +909,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    if args.qat_bits > 0:
-        log0(f"qat:configured bits={args.qat_bits} onset_scale={args.qat_onset_scale} block_size={args.qat_block_size}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1131,15 +1007,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-
-        # Late-onset QAT: enable quantization simulation when LR warmdown begins.
-        if args.qat_bits > 0:
-            qat_now = scale <= args.qat_onset_scale
-            base_model.set_qat_enabled(qat_now)
-            if qat_now and step > 0 and not getattr(main, "_qat_logged", False):
-                log0(f"qat:enabled bits={args.qat_bits} onset_scale={args.qat_onset_scale} step={step}")
-                main._qat_logged = True
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
