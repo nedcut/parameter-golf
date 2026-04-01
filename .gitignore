@@ -17,3 +17,6 @@ final_model.pt
 final_model.int8.ptz
 .codex
 pg-*.out
+slurm/output/*.out
+slurm/output/*.err
+!slurm/output/.gitkeep

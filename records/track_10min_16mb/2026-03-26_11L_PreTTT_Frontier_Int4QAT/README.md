@@ -89,6 +89,11 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 - `QAT_BITS=4` is the only supported value for the new Hadamard/trust-gradient path.
 - `QAT_ONSET_SCALE` defaults to `0.15` on this scaffold because that is already validated in the public late-QAT record stack.
+- For int4 runs, the wrapper maps `QAT_ONSET_SCALE` onto the inherited late-QAT scheduler so the runtime gate actually turns on when warmdown reaches the requested scale.
 - The wrapper prints a `frontier_scaffold:` preflight line showing the resolved QAT mode before delegating to the inherited March 22 trainer.
 - For 1-GPU smoke tests, use `torchrun --standalone --nproc_per_node=1 train_gpt.py`.
+- For 200-step smoke tests, set `WARMDOWN_ITERS=$ITERATIONS` so "late-onset" behavior is actually late inside the short run.
+- Set `FRONTIER_PRE_EMA_EXPORT_DIAGNOSTIC=1` to emit `pre_ema_*` metrics and compare raw endpoint export against the EMA endpoint.
+- Use `./scripts/submit_frontier_matrix.sh` to launch the no-QAT, legacy-int6, and int4 smoke matrix across multiple seeds.
+- Use `python3 scripts/summarize_frontier_logs.py "slurm/output/pg-frontier-smoke-*.out"` to summarize the resulting logs as a table.
 - Run `python3 trust_gradient_check.py` for a lightweight regression check of the trust-gradient masking semantics.

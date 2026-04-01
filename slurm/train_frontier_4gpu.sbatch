@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=pg-4gpu
+#SBATCH --job-name=pg-frontier-4gpu
 #SBATCH --partition=gpu-standard
 #SBATCH --time=08:00:00
 #SBATCH --gres=gpu:4
@@ -13,13 +13,15 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
 BASE_STORAGE="${STORAGE:-${SCRATCH:-$HOME}}"
 DATA_ROOT="${DATA_ROOT:-$BASE_STORAGE/parameter-golf-data}"
 RUN_ROOT="${RUN_ROOT:-$BASE_STORAGE/parameter-golf-runs}"
-RUN_ID="${RUN_ID:-train4-${SLURM_JOB_ID}}"
+RUN_ID="${RUN_ID:-frontier4-${SLURM_JOB_ID}}"
 VARIANT="${VARIANT:-sp1024}"
+FRONTIER_REL_DIR="records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT"
 
 DATA_PATH="${DATA_PATH:-$DATA_ROOT/datasets/fineweb10B_${VARIANT}}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-$DATA_ROOT/tokenizers/fineweb_1024_bpe.model}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 RUN_DIR="$RUN_ROOT/$RUN_ID"
+SCRIPT_PATH="$REPO_ROOT/$FRONTIER_REL_DIR/train_gpt.py"
 
 cd "$REPO_ROOT"
 
@@ -48,14 +50,42 @@ export RUN_ID
 export DATA_PATH
 export TOKENIZER_PATH
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
+export SEED="${SEED:-1337}"
+export ITERATIONS="${ITERATIONS:-20000}"
+export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-786432}"
+export TRAIN_SEQ_LEN="${TRAIN_SEQ_LEN:-2048}"
+export EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-2048}"
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-524288}"
+export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-4000}"
+export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-500}"
+export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-0}"
+export WARMDOWN_ITERS="${WARMDOWN_ITERS:-3500}"
+export QAT_BITS="${QAT_BITS:-0}"
+export QAT_ENABLED="${QAT_ENABLED:-0}"
+export QAT_BLOCK_SIZE="${QAT_BLOCK_SIZE:-128}"
+export QAT_ONSET_SCALE="${QAT_ONSET_SCALE:-0.15}"
+export LATE_QAT_THRESHOLD="${LATE_QAT_THRESHOLD:-0}"
+export FRONTIER_PRE_EMA_EXPORT_DIAGNOSTIC="${FRONTIER_PRE_EMA_EXPORT_DIAGNOSTIC:-0}"
+export FRONTIER_PRE_EMA_SNAPSHOT_PATH="${FRONTIER_PRE_EMA_SNAPSHOT_PATH:-final_model_pre_ema.pt}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 echo "Repo root: $REPO_ROOT"
 echo "Run dir: $RUN_DIR"
+echo "Frontier dir: $FRONTIER_REL_DIR"
+echo "Train script: $SCRIPT_PATH"
 echo "Data path: $DATA_PATH"
 echo "Tokenizer path: $TOKENIZER_PATH"
 echo "GPUs per node: $GPUS_PER_NODE"
+echo "ITERATIONS: $ITERATIONS"
+echo "WARMDOWN_ITERS: $WARMDOWN_ITERS"
+echo "QAT_BITS: $QAT_BITS"
+echo "QAT_ENABLED: $QAT_ENABLED"
+echo "QAT_ONSET_SCALE: $QAT_ONSET_SCALE"
+echo "LATE_QAT_THRESHOLD: $LATE_QAT_THRESHOLD"
+echo "QAT_BLOCK_SIZE: $QAT_BLOCK_SIZE"
+echo "FRONTIER_PRE_EMA_EXPORT_DIAGNOSTIC: $FRONTIER_PRE_EMA_EXPORT_DIAGNOSTIC"
+echo "FRONTIER_PRE_EMA_SNAPSHOT_PATH: $FRONTIER_PRE_EMA_SNAPSHOT_PATH"
 echo "Python: $PYTHON"
 "$PYTHON" --version
 echo "Torchrun: $TORCHRUN"
@@ -64,6 +94,6 @@ echo "Starting: $(date)"
 "$TORCHRUN" \
     --standalone \
     --nproc_per_node="$GPUS_PER_NODE" \
-    "$REPO_ROOT/train_gpt.py"
+    "$SCRIPT_PATH"
 
 echo "Finished: $(date)"
