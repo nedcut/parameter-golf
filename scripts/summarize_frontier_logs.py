@@ -64,8 +64,12 @@ def parse_log(path: Path) -> dict[str, object]:
         "late_qat_threshold": None,
         "step200_val_bpb": None,
         "post_ema_val_bpb": None,
+        "final_float_fixed_bpb": None,
+        "final_float_sliding_bpb": None,
         "pre_ema_source_bpb": None,
         "pre_ema_int6_bpb": None,
+        "final_quant_fixed_bpb": None,
+        "final_quant_sliding_bpb": None,
         "final_int6_bpb": None,
         "submission_size_bytes": None,
         "pre_ema_submission_size_bytes": None,
@@ -99,10 +103,18 @@ def parse_log(path: Path) -> dict[str, object]:
             summary["step200_val_bpb"] = parse_pairs(line).get("val_bpb")
         elif line.startswith("DIAGNOSTIC post_ema "):
             summary["post_ema_val_bpb"] = parse_pairs(line).get("val_bpb")
+        elif line.startswith("final_float_fixed_exact "):
+            summary["final_float_fixed_bpb"] = parse_pairs(line).get("val_bpb")
+        elif line.startswith("final_float_sliding_exact "):
+            summary["final_float_sliding_bpb"] = parse_pairs(line).get("val_bpb")
         elif line.startswith("pre_ema_roundtrip_source_exact "):
             summary["pre_ema_source_bpb"] = parse_pairs(line).get("val_bpb")
         elif line.startswith("pre_ema_int6_roundtrip_exact "):
             summary["pre_ema_int6_bpb"] = parse_pairs(line).get("val_bpb")
+        elif line.startswith("final_quantized_fixed_exact "):
+            summary["final_quant_fixed_bpb"] = parse_pairs(line).get("val_bpb")
+        elif line.startswith("final_quantized_sliding_exact "):
+            summary["final_quant_sliding_bpb"] = parse_pairs(line).get("val_bpb")
         elif line.startswith("final_int6_roundtrip_exact "):
             summary["final_int6_bpb"] = parse_pairs(line).get("val_bpb")
         elif line.startswith("Total submission size int6+"):
@@ -126,6 +138,10 @@ def render_markdown(rows: list[dict[str, object]]) -> str:
         "iters",
         "warmdown",
         "step200_bpb",
+        "float_fixed",
+        "float_sliding",
+        "quant_fixed",
+        "quant_sliding",
         "pre_ema_int6",
         "post_ema",
         "final_int6",
@@ -144,6 +160,10 @@ def render_markdown(rows: list[dict[str, object]]) -> str:
             str(row.get("iterations") or ""),
             str(row.get("warmdown_iters") or ""),
             f"{row['step200_val_bpb']:.6f}" if row.get("step200_val_bpb") is not None else "",
+            f"{row['final_float_fixed_bpb']:.6f}" if row.get("final_float_fixed_bpb") is not None else "",
+            f"{row['final_float_sliding_bpb']:.6f}" if row.get("final_float_sliding_bpb") is not None else "",
+            f"{row['final_quant_fixed_bpb']:.6f}" if row.get("final_quant_fixed_bpb") is not None else "",
+            f"{row['final_quant_sliding_bpb']:.6f}" if row.get("final_quant_sliding_bpb") is not None else "",
             f"{row['pre_ema_int6_bpb']:.6f}" if row.get("pre_ema_int6_bpb") is not None else "",
             f"{row['post_ema_val_bpb']:.6f}" if row.get("post_ema_val_bpb") is not None else "",
             f"{row['final_int6_bpb']:.6f}" if row.get("final_int6_bpb") is not None else "",

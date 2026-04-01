@@ -42,7 +42,9 @@ Decision: keep the beginner-oriented top-level trainer mostly stable. Competitiv
 - [x] Internal docs updated to reflect the real frontier
 - [x] New pre-TTT frontier scaffold created under `records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT`
 - [x] 1-GPU CUDA smoke matrix on the new frontier scaffold
-- [ ] Finish the current 4-GPU no-QAT control on the scaffold
+- [x] 4-GPU no-QAT control on the scaffold (frontier4-a-noqat-s1337, completed 2026-03-31)
+  - post-EMA val_bpb: 1.1187 | int6 roundtrip: 1.1281 | int6 sliding-window: 1.1045 | size: 15.75 MB
+  - XSA last_4 only, warmdown 3500 — March 25 gaps (XSA-all, BigramHash 3072x112, warmdown 4000) still to close
 - [ ] Re-target the scaffold from March 23 parity toward March 25 parity
 - [ ] Pre-TTT parity check against the March 25 no-TTT stack
 - [ ] Int4-QAT ablation on the parity stack
