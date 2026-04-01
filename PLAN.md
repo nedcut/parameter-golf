@@ -45,7 +45,11 @@ Decision: keep the beginner-oriented top-level trainer mostly stable. Competitiv
 - [x] 4-GPU no-QAT control on the scaffold (frontier4-a-noqat-s1337, completed 2026-03-31)
   - post-EMA val_bpb: 1.1187 | int6 roundtrip: 1.1281 | int6 sliding-window: 1.1045 | size: 15.75 MB
   - XSA last_4 only, warmdown 3500 — March 25 gaps (XSA-all, BigramHash 3072x112, warmdown 4000) still to close
-- [ ] Re-target the scaffold from March 23 parity toward March 25 parity
+- [x] Re-target the scaffold from March 23 parity toward March 25 parity
+- [x] 4-GPU no-QAT upgraded control on the scaffold (frontier4-xsa11-wd4000-noqat, completed 2026-04-01)
+  - post-EMA fixed: 1.1171 | float sliding: 1.0935 | int6 fixed: 1.1256 | int6 sliding: 1.1019 | size: 15.62 MB
+  - gain vs prior control: `-0.0016` post-EMA fixed | `-0.0025` int6 fixed | `-0.0026` int6 sliding | size also improved
+  - new baseline keeps `XSA_LAST_N=11` and `WARMDOWN_ITERS=4000`; biggest March 25 gaps now are BigramHash `3072x112`, GPTQ with AR self-gen calibration, and Parameter Banking + Parallel Muon
 - [ ] Pre-TTT parity check against the March 25 no-TTT stack
 - [ ] Int4-QAT ablation on the parity stack
 - [ ] Int4 export / larger-model follow-up if int4 QAT shows value
@@ -145,8 +149,8 @@ These are worth tracking, but they should not preempt March 25 parity:
 
 ## Near-Term Next Steps
 
-1. Let the current 4-GPU no-QAT control finish and use it as the reference run for the scaffold
-2. Port the highest-signal March 25 deltas first: XSA-all, BigramHash `3072x112`, and warmdown 4000
-3. Re-run a matched no-QAT smoke and then a 4-GPU control on that stronger stack
-4. Port Parameter Banking + Parallel Muon once the architectural deltas are in place
-5. Only after that, revisit int4-QAT on the stronger stack and judge whether export work is justified
+1. Keep `XSA_LAST_N=11` and `WARMDOWN_ITERS=4000` as the scaffold baseline
+2. Port the next March 25 architectural delta: BigramHash `3072x112`
+3. Re-run a matched no-QAT smoke and then a 4-GPU control on that stronger stack, watching artifact headroom closely
+4. Port GPTQ with AR self-generated calibration after the architectural deltas are stable, since export quality is now the largest remaining gap
+5. Port Parameter Banking + Parallel Muon after that, then revisit int4-QAT on the stronger stack

@@ -133,3 +133,38 @@ The CUDA path still assumes `WORLD_SIZE` divides 8 so gradient accumulation stay
 That means even single-GPU smoke tests should use:
 
 - `torchrun --standalone --nproc_per_node=1 ...`
+
+## April 1, 2026 Run Log
+
+### Frontier Control Upgrade
+
+Run:
+
+- `frontier4-xsa11-wd4000-noqat`
+- scaffold: `records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT`
+- changes vs prior control: `XSA_LAST_N=11`, `WARMDOWN_ITERS=4000`
+- kept fixed: no QAT, `EVAL_STRIDE=64`
+
+Final metrics:
+
+| Metric | Value |
+|------|------:|
+| post-EMA val_bpb (fixed) | `1.1171` |
+| float sliding-window val_bpb | `1.0935` |
+| int6 roundtrip (fixed) | `1.1256` |
+| int6 sliding-window (submission-style) | `1.1019` |
+| submission size | `15.62 MB` |
+
+Comparison vs prior `last_4 / warmdown3500` control:
+
+- fixed post-EMA: `1.1187 -> 1.1171` (`-0.0016`)
+- fixed int6 roundtrip: `1.1281 -> 1.1256` (`-0.0025`)
+- sliding int6 roundtrip: `1.1045 -> 1.1019` (`-0.0026`)
+- artifact size: `15.75 MB -> 15.62 MB`
+
+Takeaways:
+
+- `XSA-all + warmdown4000` is a clean improvement and should be kept as the new local baseline
+- sliding-window still gives about `-0.0237` BPB relative to fixed-window on this stack, so fixed-window remains a training proxy only
+- quantization penalty is now about `+0.0084` BPB on both fixed and sliding eval
+- next architectural delta to test is `BigramHash 3072x112`, but size headroom is only about `0.38 MB`, so artifact pressure must be watched closely until GPTQ replaces the current simple int6 export
