@@ -1,0 +1,211 @@
+# Running Parameter Golf on Middlebury HPCC
+
+This repo already includes the CUDA training path in [train_gpt.py](/home/pkcutler/parameter-golf/train_gpt.py), so the main cluster work is:
+
+1. Put the dataset somewhere shared by compute nodes.
+2. Activate a Python environment with CUDA-enabled PyTorch.
+3. Submit GPU jobs through SLURM.
+
+This guide is tailored to Ada as observed on 2026-03-30:
+
+- login node: `ada`
+- GPU partitions: `gpu-short`, `gpu-standard`, `gpu-long`
+- GPU nodes currently expose either `4x RTX A6000` or `4x RTX A5000`
+
+The official Middlebury docs for general SLURM and GPU usage are:
+
+- https://sites.middlebury.edu/hpcc/documentation/
+- https://sites.middlebury.edu/hpcc/getting-started/
+
+## Storage layout
+
+Use persistent cluster storage for the main dataset and run artifacts:
+
+```bash
+mkdir -p "$STORAGE/parameter-golf-data"
+mkdir -p "$STORAGE/parameter-golf-runs"
+```
+
+Recommended convention:
+
+- dataset root: `$STORAGE/parameter-golf-data`
+- run outputs: `$STORAGE/parameter-golf-runs`
+
+The job scripts fall back to `$SCRATCH` only if `$STORAGE` is unavailable.
+
+The provided download job symlinks the repo's ignored `data/datasets` and `data/tokenizers` paths into that storage-backed location so the existing code continues to work unchanged.
+
+## Python environment
+
+This checkout currently uses a repo-local `.conda/` environment.
+The provided SLURM scripts prefer it because it includes Python headers needed by Triton / `torch.compile` on the GPU nodes.
+
+If you need a fresh env, Middlebury recommends conda for Python projects and shows GPU PyTorch setup in their docs. A typical setup is:
+
+```bash
+module load cuda/12.6
+conda create --name parameter-golf python=3.11
+conda activate parameter-golf
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+If you hit PyTorch install issues, install CUDA-enabled PyTorch first, then install the remaining requirements.
+
+## Download the published FineWeb cache
+
+The training script expects the dataset shards and tokenizer locally accessible on the cluster filesystem.
+
+The included job script downloads the published cache into storage:
+
+```bash
+sbatch slurm/download_data_short.sbatch
+```
+
+By default it downloads the `sp1024` tokenizer family with `10` training shards, which is a good first iteration target. Override shard count at submission time if needed:
+
+```bash
+sbatch --export=ALL,TRAIN_SHARDS=80 slurm/download_data_short.sbatch
+```
+
+## Smoke test on 1 GPU
+
+Run a quick validation that your environment, data path, and CUDA stack all work:
+
+```bash
+sbatch slurm/train_smoke_1gpu.sbatch
+```
+
+Useful submission-time overrides:
+
+```bash
+sbatch --export=ALL,DATA_ROOT=$STORAGE/parameter-golf-data,RUN_ID=my-smoke slurm/train_smoke_1gpu.sbatch
+```
+
+## Frontier scaffold smoke on 1 GPU
+
+Use the March 26 pre-TTT frontier scaffold through its dedicated job:
+
+```bash
+sbatch slurm/train_frontier_smoke_1gpu.sbatch
+```
+
+The frontier smoke defaults to the explicit `QAT=off` control. Useful overrides:
+
+It also defaults `EVAL_STRIDE=0` so the smoke job skips the expensive final sliding-window evaluation and finishes comfortably inside `gpu-short`.
+The smoke script now also defaults `WARMDOWN_ITERS=$ITERATIONS`, so "late-onset" QAT tests are actually late in a 200-step smoke rather than activating immediately because of the full-run `3500`-step warmdown.
+By default it enables a pre-EMA export diagnostic and writes extra `pre_ema_*` lines to the log.
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier-smoke-noqat slurm/train_frontier_smoke_1gpu.sbatch
+```
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier-smoke-int4,QAT_BITS=4,QAT_ONSET_SCALE=0.15,QAT_BLOCK_SIZE=128 slurm/train_frontier_smoke_1gpu.sbatch
+```
+
+To launch a comparable smoke matrix across seeds and modes:
+
+```bash
+./scripts/submit_frontier_matrix.sh
+```
+
+Useful overrides:
+
+```bash
+TARGET=smoke MATRIX=full RUN_GROUP=frontier-smoke-a ./scripts/submit_frontier_matrix.sh
+TARGET=smoke MATRIX=onset SEEDS="1337" ./scripts/submit_frontier_matrix.sh
+```
+
+To summarize the resulting logs:
+
+```bash
+python3 scripts/summarize_frontier_logs.py "slurm/output/pg-frontier-smoke-*.out"
+```
+
+## Train on 4 GPUs
+
+The main training script supports distributed launch with `torchrun`. On Ada, the natural scale-up target is one full 4-GPU node:
+
+```bash
+sbatch slurm/train_4gpu.sbatch
+```
+
+Example with overrides:
+
+```bash
+sbatch --export=ALL,RUN_ID=baseline-a6000 slurm/train_4gpu.sbatch
+```
+
+## Train the frontier scaffold on 4 GPUs
+
+Use the dedicated frontier job when you want the March 26 scaffold instead of the top-level trainer:
+
+```bash
+sbatch slurm/train_frontier_4gpu.sbatch
+```
+
+This job defaults to the no-QAT control and disables the 10-minute wallclock cap so the frontier stack can run to completion on Ada. Common overrides:
+Unlike the smoke job, it keeps the full-run `WARMDOWN_ITERS=3500` default unless you override it.
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier4-noqat slurm/train_frontier_4gpu.sbatch
+```
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier4-legacy-int6,LATE_QAT_THRESHOLD=0.15 slurm/train_frontier_4gpu.sbatch
+```
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier4-int4,QAT_BITS=4,QAT_ONSET_SCALE=0.15,QAT_BLOCK_SIZE=128 slurm/train_frontier_4gpu.sbatch
+```
+
+To submit the same matrix structure on 4 GPUs later:
+
+```bash
+TARGET=full MATRIX=baseline RUN_GROUP=frontier4-a ./scripts/submit_frontier_matrix.sh
+```
+
+Important note: the challenge leaderboard target is 8xH100 in under 10 minutes. Ada's current GPU nodes are 4x RTX A6000 or 4x RTX A5000, so cluster runs are great for experimentation and scaling studies, but not a hardware match for the official benchmark.
+
+## Monitoring jobs
+
+Useful commands:
+
+```bash
+squeue -u "$USER"
+sacct -j <jobid> --format=JobID,JobName,Partition,Elapsed,State,ExitCode
+srun --overlap --jobid=<jobid> --pty nvidia-smi
+```
+
+## Outputs
+
+The SLURM scripts in [slurm](/home/pkcutler/parameter-golf/slurm) keep the scheduler stdout/stderr copy under:
+
+```bash
+slurm/output/%x-%j.out
+```
+
+The actual training artifacts for each run still go into:
+
+```bash
+$STORAGE/parameter-golf-runs/<run-id>
+```
+
+That run directory will contain the trainer outputs, for example:
+
+- `logs/<run-id>.txt`
+- `final_model.pt`
+- `final_model.int8.ptz`
+
+## Picking partitions
+
+- `gpu-short`: fastest queue to test with, 2 hour limit
+- `gpu-standard`: better default for longer experiments, 2 day limit
+- `gpu-long`: use when you explicitly need multi-day runs
+
+## Notes about this repo
+
+- [train_gpt.py](/home/pkcutler/parameter-golf/train_gpt.py) requires CUDA and will fail on the login node by design.
+- The script expects `WORLD_SIZE` to divide 8, so `1`, `2`, or `4` GPUs work cleanly on this cluster.
+- The repo currently does not have dataset shards checked into `data/datasets`, so plan on using the storage-backed paths from the SLURM scripts.

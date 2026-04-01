@@ -1,0 +1,7 @@
+{
+  "name": "11L Pre-TTT Frontier + Int4 QAT Scaffold",
+  "author": "nedcutler",
+  "date": "2026-03-26",
+  "score": null,
+  "blurb": "Local frontier catch-up scaffold: March 22 EMA+GPTQ-lite base being retuned toward the March 25 no-TTT frontier, plus experimental int4 late-onset Hadamard/trust-gradient QAT."
+}

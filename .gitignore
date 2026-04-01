@@ -6,6 +6,17 @@ modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
+data/docs_selected.source_manifest.json
 .mypy_cache/
 .venv
+.conda/
 logs/
+remote-logs/
+.env.runpod
+final_model.pt
+final_model.int8.ptz
+.codex
+pg-*.out
+slurm/output/*.out
+slurm/output/*.err
+!slurm/output/.gitkeep
