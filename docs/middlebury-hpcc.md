@@ -148,6 +148,10 @@ sbatch slurm/train_frontier_4gpu.sbatch
 This job defaults to the no-QAT control and disables the 10-minute wallclock cap so the frontier stack can run to completion on Ada. Common overrides:
 Unlike the smoke job, it keeps the full-run `WARMDOWN_ITERS=3500` default unless you override it.
 
+If you want a rough local proxy for the official `10 minutes on 8xH100` budget, the 4-GPU frontier job now supports `H100_PROXY=1`.
+By default this multiplies `600s` by `H100_EQUIV_MULTIPLIER=11.72`, which is based on the observed April 1 Ada run speed of about `1015 ms/step` versus the March 25 reference speed of about `86.6 ms/step`.
+That yields `MAX_WALLCLOCK_SECONDS≈7032`, or about `117 minutes`.
+
 ```bash
 sbatch --export=ALL,RUN_ID=frontier4-noqat slurm/train_frontier_4gpu.sbatch
 ```
@@ -159,6 +163,20 @@ sbatch --export=ALL,RUN_ID=frontier4-legacy-int6,LATE_QAT_THRESHOLD=0.15 slurm/t
 ```bash
 sbatch --export=ALL,RUN_ID=frontier4-int4,QAT_BITS=4,QAT_ONSET_SCALE=0.15,QAT_BLOCK_SIZE=128 slurm/train_frontier_4gpu.sbatch
 ```
+
+To run in H100-proxy mode:
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier4-proxy,H100_PROXY=1 slurm/train_frontier_4gpu.sbatch
+```
+
+To override the slowdown estimate without changing the script:
+
+```bash
+sbatch --export=ALL,RUN_ID=frontier4-proxy-tuned,H100_PROXY=1,H100_EQUIV_MULTIPLIER=10.8 slurm/train_frontier_4gpu.sbatch
+```
+
+If you set `MAX_WALLCLOCK_SECONDS` explicitly, that still wins over `H100_PROXY=1`.
 
 To submit the same matrix structure on 4 GPUs later:
 
