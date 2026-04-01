@@ -62,14 +62,18 @@ The top-level trainer is still a good starting point, but it is intentionally no
   - `QAT_ONSET_SCALE`
   - `QAT_BLOCK_SIZE`
 
-## Frontier Snapshot As Of March 26, 2026
+## Frontier Snapshot As Of March 31, 2026
 
 Current public 10-minute SOTA:
 
-- `1.1194 val_bpb`
-- March 23 record: `LeakyReLU^2 + Legal Score-First TTT + Parallel Muon`
+- `1.1147 val_bpb`
+- March 25 record: `AR Self-Gen GPTQ + XSA-all + BigramHash 3072x112`
 
-Current stretch target once the March 23 retunes are fully in place:
+Current no-TTT parity target:
+
+- about `1.1147 val_bpb` from the March 25 stack
+
+Useful intermediate waypoint:
 
 - about `1.1218 val_bpb` from the March 23 stack before TTT
 
@@ -80,8 +84,8 @@ Nearest codebase checkpoint to build from:
 Important nuance:
 
 - the current frontier scaffold starts from the March 22 codebase
-- it already retunes some settings toward March 23, including `LeakyReLU(0.5)^2`, `BIGRAM_VOCAB_SIZE=1536`, and `lzma`
-- it is not yet the full March 23 stack because Parameter Banking + Parallel Muon and legal TTT are still absent
+- it already retunes some settings beyond that base, including `LeakyReLU(0.5)^2`, `BIGRAM_VOCAB_SIZE=1536`, and `lzma`
+- it is not yet the full March 25 stack because XSA-all, BigramHash `3072x112`, warmdown 4000, full-Hessian GPTQ calibration, and Parameter Banking + Parallel Muon are still absent
 
 ## Starter Trainer vs Frontier Stack
 
@@ -92,10 +96,10 @@ Important nuance:
 | MLP width | 2x | 3x | competitive `records/` path |
 | Sequence length | 1024 | 2048 | competitive `records/` path |
 | RoPE | full | partial 16/64 | competitive `records/` path |
-| Attention tweak | none | XSA on last 4 layers | competitive `records/` path |
+| Attention tweak | none | XSA on all 11 layers | competitive `records/` path |
 | Token identity features | none | BigramHash + VE128 | competitive `records/` path |
 | Averaging | none | EMA + tight SWA | competitive `records/` path |
-| Export | int8 + zlib | GPTQ-lite int6 + lzma | competitive `records/` path |
+| Export | int8 + zlib | full-Hessian GPTQ + self-generated calibration | competitive `records/` path |
 | Eval | fixed-window | sliding-window stride 64 | competitive `records/` path |
 | Weight decay | none | Muon/Adam WD 0.04 | competitive `records/` path |
 | Optimizer systems | classic Muon | Parameter Banking + Parallel Muon | later competitive `records/` path |
@@ -117,10 +121,10 @@ Current local scaffold for that work:
 
 ## High-Probability Levers From Here
 
-1. Match the March 22 sanity target first, then close the gap toward the March 23 pre-TTT stretch target
-2. Ablate int4 late-onset QAT on that stronger stack
-3. Only then explore int4 export and larger models
-4. Add legal score-first TTT after pre-TTT parity is stable
+1. Match the March 22 sanity target first, then port the highest-signal March 25 deltas: XSA-all, BigramHash `3072x112`, and warmdown 4000
+2. Port Parameter Banking + Parallel Muon on that stronger stack
+3. Ablate int4 late-onset QAT only after the stronger no-TTT stack is in place
+4. Explore int4 export, larger models, or legal TTT only after that
 
 ## Non-Obvious Operational Detail
 
