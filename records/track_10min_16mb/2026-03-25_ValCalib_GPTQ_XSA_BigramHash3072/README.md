@@ -69,12 +69,12 @@ PR #549 used Legal Score-First TTT for −0.0025 BPB. On this stack, TTT is neut
 
 ## Requirements
 
-**Flash Attention 3 (Hopper) is required.** The script imports `flash_attn_interface` directly and was run with PyTorch 2.9.1+cu128.
+**Flash Attention 3 (Hopper) is preferred but no longer required.** If `flash_attn_interface` imports cleanly, the script will use it; otherwise it falls back to PyTorch SDPA with the same call signature. The original record run used PyTorch 2.9.1+cu128.
 
 ```bash
 pip install --break-system-packages flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291
 pip install sentencepiece zstandard
-python3 -c "from flash_attn_interface import flash_attn_func; import sentencepiece, zstandard; print('deps OK')"
+python3 -c "import sentencepiece, zstandard; print('deps OK')"
 ```
 
 ## Run Command

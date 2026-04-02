@@ -9,7 +9,6 @@ import sys
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
-import types
 
 import torch
 import torch.nn.functional as F
@@ -23,9 +22,14 @@ BASE_SCRIPT = (
 )
 
 
-if "flash_attn_interface" not in sys.modules:
+try:
+    import flash_attn_interface  # noqa: F401
+except Exception:
     # The March 22 base script expects FlashAttention 3. On cluster environments
-    # where that module is unavailable, provide a compatible SDPA fallback.
+    # where that module is missing or its compiled extension is not importable,
+    # provide a compatible SDPA fallback.
+    import types
+
     flash_attn_interface = types.ModuleType("flash_attn_interface")
 
     def _flash_attn_fallback(q: Tensor, k: Tensor, v: Tensor, causal: bool = True) -> Tensor:
