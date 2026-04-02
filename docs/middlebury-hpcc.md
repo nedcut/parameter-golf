@@ -184,6 +184,30 @@ To submit the same matrix structure on 4 GPUs later:
 TARGET=full MATRIX=baseline RUN_GROUP=frontier4-a ./scripts/submit_frontier_matrix.sh
 ```
 
+## Run the March 25 frontier record stack on 4 GPUs
+
+When you want the latest upstream legal frontier recipe rather than the older March 26 scaffold, use:
+
+```bash
+sbatch slurm/train_march25_frontier_4gpu.sbatch
+```
+
+This launcher defaults to the March 25 record settings that matter most on the local cluster:
+
+- `BIGRAM_VOCAB_SIZE=3072`
+- `BIGRAM_DIM=112`
+- `WARMDOWN_ITERS=4000`
+- `TARGET_MB=15.9`
+- `SEED=42`
+
+To run the best local proxy for the official 10-minute budget:
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy,H100_PROXY=1 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+That keeps the March 25 model stack but replaces the default 600-second cap with the local H100-equivalent proxy budget from `H100_EQUIV_MULTIPLIER`.
+
 Important note: the challenge leaderboard target is 8xH100 in under 10 minutes. Ada's current GPU nodes are 4x RTX A6000 or 4x RTX A5000, so cluster runs are great for experimentation and scaling studies, but not a hardware match for the official benchmark.
 
 ## Monitoring jobs
