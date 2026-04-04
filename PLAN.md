@@ -78,6 +78,11 @@ Decision: keep the beginner-oriented top-level trainer mostly stable. Competitiv
 - [x] Milder late-QAT follow-up checked and deprioritized (pg-march25-frontier-4gpu-54861, completed 2026-04-03)
   - `LATE_QAT_THRESHOLD=0.10` with `GPTQ_AR_CALIB_TEMP=0.9` reached `6808` steps and regressed to int6 sliding `1.11751938`
   - size also regressed to `16,048,254` bytes, so this setting should not be pursued further
+- [x] March 25 matched-proxy closeout finished after reruns and calibration-seed checks (pg-march25-frontier-4gpu-54865/54866/54867/54868, completed 2026-04-04)
+  - clean rerun `54866` (`seed=314`, no-QAT, `temp=0.9`) reached `6932` steps and improved to float sliding `1.11196138` | int6 sliding `1.11587877` | size `15,856,990`
+  - overlapping rerun `54865` only reached `5953` steps and should be treated as runtime-contaminated, not as a recipe datapoint
+  - calibration-seed checks were not promising: clean `54868` (`GPTQ_AR_CALIB_SEED=42`) regressed to int6 sliding `1.11628764`, while `54867` was both slower and worse
+  - final March 25 read: freeze the local parity base at `H100_EQUIV_MULTIPLIER=11.25` and `LATE_QAT_THRESHOLD=0`; treat `GPTQ_AR_CALIB_TEMP=0.9` as optional, but stop broader export and legacy late-QAT sweeps
 - [ ] Pre-TTT parity check against the March 25 no-TTT stack
 - [ ] Int4-QAT ablation on the parity stack
 - [ ] Int4 export / larger-model follow-up if int4 QAT shows value
@@ -178,8 +183,8 @@ These are worth tracking, but they should not preempt March 25 parity:
 
 ## Near-Term Next Steps
 
-1. Treat `H100_EQUIV_MULTIPLIER=11.25` as the local March 25 parity proxy baseline and `LATE_QAT_THRESHOLD=0` as the current working default
-2. If we want one last export adjudication run, re-run `seed=314` with `LATE_QAT_THRESHOLD=0` and `GPTQ_AR_CALIB_TEMP=0.9` on a clean node before promoting that temperature tweak
-3. Otherwise freeze the matched-proxy base as clean no-QAT and stop spending time on legacy late-QAT onset sweeps
-4. Port int4 late-onset Hadamard / trust-gradient QAT onto that exact no-QAT parity stack
-5. Only return to broader export sweeps if the int4 port needs more artifact headroom or roundtrip quality
+1. Freeze the March 25 local proxy baseline at `H100_EQUIV_MULTIPLIER=11.25` with `LATE_QAT_THRESHOLD=0`; use `GPTQ_AR_CALIB_TEMP=0.8` as the conservative default and treat `0.9` as optional rather than promoted
+2. Finish the local matched-proxy control as a real 3-seed no-QAT baseline by adding `seed=999`
+3. Port int4 late-onset Hadamard / trust-gradient QAT onto that exact frozen no-QAT stack before doing any more broad March 25 micro-sweeps
+4. Start the int4 check with a narrow seed-314 matrix: control, onset `0.15`, and onset `0.20`
+5. Do not spend more time on legacy late-QAT onset sweeps, `GPTQ_AR_CALIB_SEQS > 64`, or calibration-seed sweeps unless the int4 work specifically exposes a new export bottleneck

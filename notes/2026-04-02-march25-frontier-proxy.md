@@ -324,3 +324,133 @@ sbatch --export=ALL,RUN_ID=march25-proxy1125-s314-noqat-temp09-rerun,H100_PROXY=
 ```
 
 Otherwise the cleaner move is to freeze the local parity base as `no-QAT` and move on to the int4-QAT port.
+
+## Closeout After `54865` To `54868` (2026-04-04)
+
+Four more logs closed the remaining March 25 questions:
+
+- `slurm/output/pg-march25-frontier-4gpu-54865.out` — overlapping rerun of `seed=314`, `LATE_QAT_THRESHOLD=0`, `GPTQ_AR_CALIB_TEMP=0.9`
+- `slurm/output/pg-march25-frontier-4gpu-54866.out` — second overlapping rerun of the same config
+- `slurm/output/pg-march25-frontier-4gpu-54867.out` — `seed=314`, `LATE_QAT_THRESHOLD=0`, `GPTQ_AR_CALIB_TEMP=0.8`, `GPTQ_AR_CALIB_SEED=42`
+- `slurm/output/pg-march25-frontier-4gpu-54868.out` — `seed=314`, `LATE_QAT_THRESHOLD=0`, `GPTQ_AR_CALIB_TEMP=0.9`, `GPTQ_AR_CALIB_SEED=42`
+
+### Result table
+
+| Log | Change | Steps | Float sliding | Int6 sliding | Size | Read |
+|-----|--------|-------|---------------|--------------|------|------|
+| `54865` | no-QAT + temp `0.9` rerun | `5953` | `1.11861368` | `1.12224883` | `15,880,338` | runtime-contaminated |
+| `54866` | no-QAT + temp `0.9` rerun | `6932` | `1.11196138` | `1.11587877` | `15,856,990` | best clean seed-314 export result |
+| `54867` | no-QAT + calib seed `42` | `6566` | `1.11550421` | `1.11925238` | `15,908,078` | runtime-contaminated and worse |
+| `54868` | no-QAT + temp `0.9` + calib seed `42` | `6925` | `1.11237194` | `1.11628764` | `15,856,506` | clean but worse than calib seed `314` |
+
+### Final read
+
+#### 1. The clean `seed=314` rerun confirms the earlier no-QAT story
+
+`54866` is the useful rerun, not `54865`.
+
+Compared with the clean no-QAT seed-314 baseline `54846`:
+
+- `54846`: float sliding `1.11201207`, int6 sliding `1.11608931`
+- `54866`: float sliding `1.11196138`, int6 sliding `1.11587877`
+
+That is a small but real-looking improvement for `GPTQ_AR_CALIB_TEMP=0.9` on seed `314`:
+
+- float sliding: `-0.00005069`
+- int6 sliding: `-0.00021054`
+
+So `temp=0.9` remains plausible as a seed-314 export tweak, but the effect is modest.
+
+#### 2. The overlapping rerun pattern made `54865` unusable
+
+`54865` and `54866` shared the same `RUN_ID` and run directory and overlapped in time, just like the earlier `54854` and `54855` pair. `54865` only reached `5953` steps and should be treated as a bad runtime datapoint, not as evidence about the recipe.
+
+Practical lesson: do not submit concurrent jobs with the same `RUN_ID` again when collecting ablations.
+
+#### 3. Calibration-seed sweeps do not look worth more time
+
+`54868` is the only clean calibration-seed test in this mini-batch, and it lost to `54866`:
+
+- `54866` (`temp=0.9`, calib seed `314`): int6 sliding `1.11587877`
+- `54868` (`temp=0.9`, calib seed `42`): int6 sliding `1.11628764`
+
+That is a regression of `+0.00040887` BPB.
+
+`54867` also looked bad, but it only reached `6566` steps, so the clean conclusion should come from `54868`: decoupling `GPTQ_AR_CALIB_SEED` from the training seed is not a promising direction on this stack.
+
+#### 4. The March 25 verdict is now stable enough to freeze
+
+The useful clean signals across the full sweep are:
+
+- no-QAT beats late-QAT at matched proxy
+- `GPTQ_AR_CALIB_TEMP=0.9` is at best a small export-only gain, not a robust new default
+- broader export sweeps like `seqs=96` and calibration-seed changes are not paying off
+- the main residual variance is throughput / step-count noise, not missing feature flags
+
+### Updated recommendation
+
+Freeze the local matched-proxy parity base as:
+
+- `H100_EQUIV_MULTIPLIER=11.25`
+- `LATE_QAT_THRESHOLD=0`
+- `GPTQ_AR_CALIB_TEMP=0.8` as the conservative default
+
+Treat this as the optional export-only sidecar:
+
+- `GPTQ_AR_CALIB_TEMP=0.9` on the same frozen no-QAT stack when checking whether a specific seed benefits
+
+Do not spend more time on:
+
+- legacy late-QAT onset sweeps
+- `GPTQ_AR_CALIB_SEQS > 64`
+- calibration-seed sweeps
+- concurrent reruns that share a `RUN_ID`
+
+## Recommended Next Experiments
+
+### 1. Finish the local 3-seed no-QAT matched-proxy baseline
+
+The record comparison is still 3-seed, while the clean local no-QAT read is only 2-seed.
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy1125-s999-noqat,H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25,SEED=999,LATE_QAT_THRESHOLD=0 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+Why first:
+
+- it closes the parity bookkeeping cleanly
+- it tells us whether the current local gap is still real at the 3-seed level
+- it gives the int4 port a better control than a 2-seed mean
+
+### 2. Port int4 Hadamard / trust-gradient QAT onto the frozen no-QAT base
+
+Once the 3-seed no-QAT control is in place, move the new idea onto the exact stack that won this sweep instead of continuing legacy late-QAT work.
+
+Start with a narrow seed-314 matrix:
+
+- `QAT=off` control on the frozen no-QAT base
+- int4 QAT with onset `0.15`
+- int4 QAT with onset `0.20`
+
+Why this matrix:
+
+- `0.10` already looked too aggressive in the int6-style late-QAT setting
+- `0.15` is the historical frontier default
+- `0.20` tests whether the new int4 path wants an even later onset on the tighter local budget
+
+### 3. Only keep one small export sidecar alive
+
+If we want one non-int4 sidecar while the port lands, make it:
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy1125-s999-noqat-temp09,H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25,SEED=999,LATE_QAT_THRESHOLD=0,GPTQ_AR_CALIB_TEMP=0.9 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+This is only worth doing if the `seed=999` no-QAT control looks strong enough that a `temp=0.9` confirmatory run could realistically become the frozen export default.
+
+### 4. Stop broad March 25 churn after that
+
+If the 3-seed no-QAT mean still sits around the current local plateau, the right move is not more March 25 micro-sweeps. The right move is to use this stack as the stable base for:
+
+- the int4 QAT ablation
+- later artifact-headroom or scale-up work if int4 earns it

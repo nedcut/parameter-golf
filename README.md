@@ -26,6 +26,32 @@ The challenge runs from March 18th to April 30th.
 
 Happy training!
 
+## Working In This Fork
+
+This repository is the upstream challenge repo, but this checkout is also being used as a competitive personal fork.
+
+If you are trying to get productive in **this fork** rather than just understand the public challenge, start here:
+
+1. Read [PLAN.md](/home/pkcutler/parameter-golf/PLAN.md) for the current experiment order, frozen baselines, and next milestones.
+2. Read [docs/middlebury-hpcc.md](/home/pkcutler/parameter-golf/docs/middlebury-hpcc.md) for the actual SLURM workflow used on Middlebury HPCC.
+3. Treat [records/track_10min_16mb/2026-03-25_ValCalib_GPTQ_XSA_BigramHash3072/README.md](/home/pkcutler/parameter-golf/records/track_10min_16mb/2026-03-25_ValCalib_GPTQ_XSA_BigramHash3072/README.md) as the source-of-truth for the current public March 25 frontier stack.
+4. Treat [notes/2026-04-02-march25-frontier-proxy.md](/home/pkcutler/parameter-golf/notes/2026-04-02-march25-frontier-proxy.md) as the source-of-truth for local March 25 replications, ablations, and what has already been ruled out.
+5. Use [records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT/README.md](/home/pkcutler/parameter-golf/records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT/README.md) only for the newer int4-QAT scaffold path, not for the frozen March 25 parity baseline.
+
+Practical repo split:
+
+- top-level [train_gpt.py](/home/pkcutler/parameter-golf/train_gpt.py) is intended to stay relatively beginner-friendly
+- frontier and competitive experiments should live under `records/track_10min_16mb/...`
+- run-specific conclusions should go in `notes/`
+
+Current local baseline for March 25 parity work:
+
+- launcher: [slurm/train_march25_frontier_4gpu.sbatch](/home/pkcutler/parameter-golf/slurm/train_march25_frontier_4gpu.sbatch)
+- proxy mode: `H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25`
+- working default: `LATE_QAT_THRESHOLD=0`
+- conservative export default: `GPTQ_AR_CALIB_TEMP=0.8`
+- optional export sidecar: `GPTQ_AR_CALIB_TEMP=0.9`
+
 ## Leaderboard
 
 | Run | Score | Author | Summary | Date | Info |

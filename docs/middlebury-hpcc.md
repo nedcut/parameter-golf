@@ -17,6 +17,25 @@ The official Middlebury docs for general SLURM and GPU usage are:
 - https://sites.middlebury.edu/hpcc/documentation/
 - https://sites.middlebury.edu/hpcc/getting-started/
 
+## Recommended Path In This Fork
+
+If you only want the shortest route to the current competitive workflow in this fork, use this order:
+
+1. Read [PLAN.md](/home/pkcutler/parameter-golf/PLAN.md) for the current frozen baseline and next experiments.
+2. Read [notes/2026-04-02-march25-frontier-proxy.md](/home/pkcutler/parameter-golf/notes/2026-04-02-march25-frontier-proxy.md) for the March 25 local replication history and what has already been ruled out.
+3. Use [slurm/train_march25_frontier_4gpu.sbatch](/home/pkcutler/parameter-golf/slurm/train_march25_frontier_4gpu.sbatch) for March 25 parity work.
+4. Use [records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT/README.md](/home/pkcutler/parameter-golf/records/track_10min_16mb/2026-03-26_11L_PreTTT_Frontier_Int4QAT/README.md) only when you are actively working on the newer int4-QAT scaffold.
+
+As of 2026-04-04, the local March 25 working baseline is:
+
+- `H100_PROXY=1`
+- `H100_EQUIV_MULTIPLIER=11.25`
+- `LATE_QAT_THRESHOLD=0`
+- `GPTQ_AR_CALIB_TEMP=0.8` as the conservative export default
+- `GPTQ_AR_CALIB_TEMP=0.9` as an optional sidecar tweak, not a promoted default
+
+One operational rule that deserves to be explicit: always use a fresh `RUN_ID` for each submitted job. Reusing a `RUN_ID` causes multiple jobs to share the same run directory and log path, which makes ablations hard to trust.
+
 ## Storage layout
 
 Use persistent cluster storage for the main dataset and run artifacts:
@@ -214,6 +233,26 @@ sbatch --export=ALL,RUN_ID=march25-proxy1125,H100_PROXY=1,H100_EQUIV_MULTIPLIER=
 ```
 
 The launcher default is still `11.72`, but the tighter `11.25` setting matched the original March 25 step budget much more closely in the April 2-4 local replications.
+
+For the current clean no-QAT baseline in this fork, use:
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy1125-s999-noqat,H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25,SEED=999,LATE_QAT_THRESHOLD=0 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+If you want the only export-side follow-up that still looks worth checking, use:
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy1125-s999-noqat-temp09,H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25,SEED=999,LATE_QAT_THRESHOLD=0,GPTQ_AR_CALIB_TEMP=0.9 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+At this point, do not prioritize:
+
+- legacy late-QAT onset sweeps on the March 25 stack
+- `GPTQ_AR_CALIB_SEQS > 64`
+- calibration-seed sweeps
+
+Those all looked flat or worse in the April 2-4 local ablations.
 
 Important note: the challenge leaderboard target is 8xH100 in under 10 minutes. Ada's current GPU nodes are 4x RTX A6000 or 4x RTX A5000, so cluster runs are great for experimentation and scaling studies, but not a hardware match for the official benchmark.
 
