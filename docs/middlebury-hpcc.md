@@ -207,6 +207,13 @@ sbatch --export=ALL,RUN_ID=march25-proxy,H100_PROXY=1 slurm/train_march25_fronti
 ```
 
 That keeps the March 25 model stack but replaces the default 600-second cap with the local H100-equivalent proxy budget from `H100_EQUIV_MULTIPLIER`.
+For the March 25 record stack specifically, the current matched-budget local baseline is:
+
+```bash
+sbatch --export=ALL,RUN_ID=march25-proxy1125,H100_PROXY=1,H100_EQUIV_MULTIPLIER=11.25 slurm/train_march25_frontier_4gpu.sbatch
+```
+
+The launcher default is still `11.72`, but the tighter `11.25` setting matched the original March 25 step budget much more closely in the April 2-4 local replications.
 
 Important note: the challenge leaderboard target is 8xH100 in under 10 minutes. Ada's current GPU nodes are 4x RTX A6000 or 4x RTX A5000, so cluster runs are great for experimentation and scaling studies, but not a hardware match for the official benchmark.
 

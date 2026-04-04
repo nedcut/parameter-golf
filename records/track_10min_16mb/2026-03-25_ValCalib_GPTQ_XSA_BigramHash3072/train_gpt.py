@@ -109,6 +109,11 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    gptq_ar_calib_seqs = int(os.environ.get("GPTQ_AR_CALIB_SEQS", 64))
+    gptq_ar_calib_seq_len = int(os.environ.get("GPTQ_AR_CALIB_SEQ_LEN", train_seq_len))
+    gptq_ar_calib_temp = float(os.environ.get("GPTQ_AR_CALIB_TEMP", 0.8))
+    gptq_ar_calib_batch_size = int(os.environ.get("GPTQ_AR_CALIB_BATCH_SIZE", 8))
+    gptq_ar_calib_seed = int(os.environ.get("GPTQ_AR_CALIB_SEED", seed))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -2010,12 +2015,18 @@ def main() -> None:
         strict=False,
     )
     # Autoregressive self-generated calibration (no external data)
-    log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
+    log0(
+        "gptq:generating autoregressive calibration data "
+        f"({args.gptq_ar_calib_seqs} seqs x {args.gptq_ar_calib_seq_len} tokens, "
+        f"temp={args.gptq_ar_calib_temp}, batch={args.gptq_ar_calib_batch_size}, "
+        f"seed={args.gptq_ar_calib_seed})..."
+    )
     base_model.load_state_dict(export_sd, strict=False)
     t_gen = time.perf_counter()
     ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=64, seq_len=args.train_seq_len,
-        vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
+        base_model, device, num_seqs=args.gptq_ar_calib_seqs, seq_len=args.gptq_ar_calib_seq_len,
+        vocab_size=args.vocab_size, temperature=args.gptq_ar_calib_temp,
+        batch_size=args.gptq_ar_calib_batch_size, seed=args.gptq_ar_calib_seed,
     )
     log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
     log0("gptq:collecting hessians from autoregressive data...")

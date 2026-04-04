@@ -85,6 +85,10 @@ TARGET_MB=15.9 SEED=314 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
+For local export-side sweeps, the AR self-generated GPTQ calibration defaults are also configurable:
+`GPTQ_AR_CALIB_SEQS=64`, `GPTQ_AR_CALIB_SEQ_LEN=2048`, `GPTQ_AR_CALIB_TEMP=0.8`,
+`GPTQ_AR_CALIB_BATCH_SIZE=8`, and `GPTQ_AR_CALIB_SEED=$SEED`.
+
 ## Lineage
 
 ```

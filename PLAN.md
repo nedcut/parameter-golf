@@ -50,6 +50,34 @@ Decision: keep the beginner-oriented top-level trainer mostly stable. Competitiv
   - post-EMA fixed: 1.1171 | float sliding: 1.0935 | int6 fixed: 1.1256 | int6 sliding: 1.1019 | size: 15.62 MB
   - gain vs prior control: `-0.0016` post-EMA fixed | `-0.0025` int6 fixed | `-0.0026` int6 sliding | size also improved
   - new baseline keeps `XSA_LAST_N=11` and `WARMDOWN_ITERS=4000`; biggest March 25 gaps now are BigramHash `3072x112`, GPTQ with AR self-gen calibration, and Parameter Banking + Parallel Muon
+- [x] 4-GPU March 25 stack reproduced locally with the full feature set (pg-march25-frontier-4gpu-54842, completed 2026-04-02)
+  - generous proxy `11.72`, seed `314`: `7217` steps | float fixed `1.13538259` | float sliding `1.11188900` | int6 sliding `1.11597348` | size `15,864,338`
+  - this confirmed the local stack and feature surface, but the proxy was slightly optimistic relative to the original H100 step budget
+- [x] 4-GPU tight-proxy matched-budget replication on the March 25 stack (pg-march25-frontier-4gpu-54843/54844, completed 2026-04-02)
+  - proxy `11.25`, seeds `314` / `42`: `6932` / `6930` steps vs March 25 record `6927` / `6922`
+  - float fixed `1.13584100` / `1.13587012` | float sliding `1.11234307` / `1.11233735`
+  - int6 sliding `1.11648884` / `1.11637954` | sizes `15,838,906` / `15,858,893`
+  - matched-proxy 2-seed mean `1.11643419` is about `+0.00170` BPB behind the March 25 record mean `1.11473509`
+  - seed variance is tiny (`0.00010930` BPB), so the remaining gap looks systematic; export quality is now the leading suspect
+- [x] First matched-proxy no-QAT ablation completed on seed `314` (pg-march25-frontier-4gpu-54846, completed 2026-04-03)
+  - `6924` steps | float sliding `1.11201207` | int6 sliding `1.11608931` | size `15,989,478`
+  - gain vs clean late-QAT seed-314 baseline `54843`: `-0.00033100` float sliding and `-0.00039953` int6 sliding
+  - tradeoff: about `+150 KB` artifact growth
+- [x] First AR self-gen calibration sweep completed on seed `314` (pg-march25-frontier-4gpu-54848/54849/54850, completed 2026-04-03)
+  - `temp=0.9` was the only promising export tweak: int6 sliding `1.11611186`
+  - `temp=0.7` regressed to `1.11682006`
+  - `seqs=96` regressed badly to `1.11780588` and should not be prioritized
+- [x] Clean seed-42 no-QAT rerun completed at a normal matched-proxy pace (pg-march25-frontier-4gpu-54857, completed 2026-04-03)
+  - `6924` steps | float sliding `1.11210100` | int6 sliding `1.11617889` | size `15,858,766`
+  - gain vs matched seed-42 late-QAT baseline `54844`: `-0.00023635` int6 sliding
+  - together with seed `314`, this gives a clean two-seed no-QAT mean of `1.11613410`, about `-0.00030009` better than the late-QAT matched baseline mean `1.11643419`
+- [x] Combo test `no-QAT + GPTQ_AR_CALIB_TEMP=0.9` checked on both seeds (pg-march25-frontier-4gpu-54855/54856, completed 2026-04-03)
+  - seed `314` run `54855` stopped at only `6745` steps and regressed badly to `1.11797646`; treat as runtime-contaminated rather than a clean verdict
+  - seed `42` run `54856` was clean at `6927` steps and landed at `1.11640480`, effectively flat vs the seed-42 late-QAT baseline `1.11637954`
+  - current read: `temp=0.9` is still a plausible export-only tweak, but it is not a reliable additive gain on top of no-QAT
+- [x] Milder late-QAT follow-up checked and deprioritized (pg-march25-frontier-4gpu-54861, completed 2026-04-03)
+  - `LATE_QAT_THRESHOLD=0.10` with `GPTQ_AR_CALIB_TEMP=0.9` reached `6808` steps and regressed to int6 sliding `1.11751938`
+  - size also regressed to `16,048,254` bytes, so this setting should not be pursued further
 - [ ] Pre-TTT parity check against the March 25 no-TTT stack
 - [ ] Int4-QAT ablation on the parity stack
 - [ ] Int4 export / larger-model follow-up if int4 QAT shows value
@@ -143,14 +171,15 @@ These are worth tracking, but they should not preempt March 25 parity:
   - VE layers and dim
   - EMA and SWA toggles
   - artifact quantizer and export mode
+  - AR self-gen GPTQ calibration count / seq len / temperature / batch / seed
   - eval stride
   - QAT onset and bit settings
 - Treat the March 22, March 23, and March 25 record READMEs as the source-of-truth spec for competitive hyperparameters and artifact behavior, with March 25 taking precedence for the current parity target.
 
 ## Near-Term Next Steps
 
-1. Keep `XSA_LAST_N=11` and `WARMDOWN_ITERS=4000` as the scaffold baseline
-2. Port the next March 25 architectural delta: BigramHash `3072x112`
-3. Re-run a matched no-QAT smoke and then a 4-GPU control on that stronger stack, watching artifact headroom closely
-4. Port GPTQ with AR self-generated calibration after the architectural deltas are stable, since export quality is now the largest remaining gap
-5. Port Parameter Banking + Parallel Muon after that, then revisit int4-QAT on the stronger stack
+1. Treat `H100_EQUIV_MULTIPLIER=11.25` as the local March 25 parity proxy baseline and `LATE_QAT_THRESHOLD=0` as the current working default
+2. If we want one last export adjudication run, re-run `seed=314` with `LATE_QAT_THRESHOLD=0` and `GPTQ_AR_CALIB_TEMP=0.9` on a clean node before promoting that temperature tweak
+3. Otherwise freeze the matched-proxy base as clean no-QAT and stop spending time on legacy late-QAT onset sweeps
+4. Port int4 late-onset Hadamard / trust-gradient QAT onto that exact no-QAT parity stack
+5. Only return to broader export sweeps if the int4 port needs more artifact headroom or roundtrip quality
