@@ -93,6 +93,9 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_bits = int(os.environ.get("QAT_BITS", 0))
+    qat_onset_scale = float(os.environ.get("QAT_ONSET_SCALE", os.environ.get("LATE_QAT_THRESHOLD", 0.15)))
+    qat_block_size = int(os.environ.get("QAT_BLOCK_SIZE", 128))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
@@ -114,6 +117,110 @@ class Hyperparameters:
     gptq_ar_calib_temp = float(os.environ.get("GPTQ_AR_CALIB_TEMP", 0.8))
     gptq_ar_calib_batch_size = int(os.environ.get("GPTQ_AR_CALIB_BATCH_SIZE", 8))
     gptq_ar_calib_seed = int(os.environ.get("GPTQ_AR_CALIB_SEED", seed))
+
+
+_OPTIMAL_GAUSSIAN_SCALES: dict[int, float] = {4: 2.5139}
+_HADAMARD_BLOCK_CACHE: dict[tuple[int, str, torch.dtype], Tensor] = {}
+
+
+class _QATRuntime:
+    enabled: bool = False
+    bits: int = 0
+    block_size: int = 128
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _resolved_runtime_late_qat_threshold(args: Hyperparameters) -> float:
+    if args.qat_bits > 0 and not args.qat_enabled:
+        return args.qat_onset_scale
+    return args.late_qat_threshold
+
+
+def _resolved_qat_mode(args: Hyperparameters) -> str:
+    if args.qat_bits > 0:
+        return "hadamard_int4_always_on" if args.qat_enabled else "hadamard_int4_late"
+    if args.qat_enabled:
+        return "legacy_int6_always_on"
+    if args.late_qat_threshold > 0:
+        return "legacy_int6_late"
+    return "off"
+
+
+def _validate_qat_config(args: Hyperparameters) -> None:
+    if args.qat_bits == 0:
+        return
+    if args.qat_bits not in _OPTIMAL_GAUSSIAN_SCALES:
+        supported = ", ".join(str(bits) for bits in sorted(_OPTIMAL_GAUSSIAN_SCALES))
+        raise ValueError(f"QAT_BITS={args.qat_bits} is unsupported; supported values: 0, {supported}")
+    if not _is_power_of_two(args.qat_block_size):
+        raise ValueError(
+            f"QAT_BLOCK_SIZE={args.qat_block_size} must be a positive power of two for Hadamard rotation"
+        )
+    quantized_widths = {
+        "MODEL_DIM": args.model_dim,
+        "MLP_MULT * MODEL_DIM": int(args.mlp_mult * args.model_dim),
+    }
+    for name, width in quantized_widths.items():
+        if width % args.qat_block_size != 0:
+            raise ValueError(
+                f"{name}={width} must be divisible by QAT_BLOCK_SIZE={args.qat_block_size} when int4 QAT is enabled"
+            )
+
+
+def _build_hadamard_block(size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    key = (size, str(device), dtype)
+    cached = _HADAMARD_BLOCK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if not _is_power_of_two(size):
+        raise ValueError(f"Hadamard block size must be a positive power of two, got {size}")
+    H = torch.ones(1, 1, device=device, dtype=torch.float32)
+    while H.shape[0] < size:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    H = (H / math.sqrt(size)).to(dtype=dtype)
+    _HADAMARD_BLOCK_CACHE[key] = H
+    return H
+
+
+def _hadamard_rotate(x: Tensor, H: Tensor) -> Tensor:
+    *batch, dim = x.shape
+    bs = H.shape[0]
+    return (x.reshape(*batch, dim // bs, bs) @ H).reshape(*batch, dim)
+
+
+def _hadamard_trust_quantize_weight(w: Tensor) -> Tensor:
+    bits = _QATRuntime.bits
+    block_size = _QATRuntime.block_size
+    if bits not in _OPTIMAL_GAUSSIAN_SCALES or w.ndim != 2 or w.shape[-1] % block_size != 0:
+        return w
+    qmax = 2 ** (bits - 1) - 1
+    alpha = _OPTIMAL_GAUSSIAN_SCALES[bits]
+    trust = alpha / (2 * qmax + 1)
+    H = _build_hadamard_block(block_size, w.device, w.dtype)
+    w_h = _hadamard_rotate(w, H)
+    std = torch.sqrt(torch.mean(w_h ** 2, dim=-1, keepdim=True)).clamp_min(1e-8)
+    step = (alpha * std) / qmax
+    w_q = torch.clamp(torch.round(w_h / step), -qmax, qmax) * step
+    mask = (torch.abs(w_q - w_h) <= std * trust).to(w_h.dtype)
+    out_h = w_h * mask + (w_q - w_h * mask).detach()
+    return _hadamard_rotate(out_h, H)
+
+
+def _apply_training_weight_quant(weight: Tensor, x_dtype: torch.dtype) -> Tensor:
+    w = weight.to(x_dtype)
+    if not _QATRuntime.enabled or w.ndim != 2:
+        return w
+    if _QATRuntime.bits > 0:
+        return _hadamard_trust_quantize_weight(w)
+    with torch.no_grad():
+        w32 = weight.float()
+        row_max = w32.abs().amax(dim=1)
+        scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+        w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x_dtype)
+    return w + (w_q - w).detach()
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -557,14 +664,7 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
+        w = _apply_training_weight_quant(self.weight, x.dtype) if self.training else self.weight.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -662,9 +762,13 @@ class CausalSelfAttention(nn.Module):
         return (y_g - proj).reshape(B, T, H, D)
     def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype))
+        q_w_eff = _apply_training_weight_quant(q_w, x.dtype) if self.training else q_w.to(x.dtype)
+        k_w_eff = _apply_training_weight_quant(k_w, x.dtype) if self.training else k_w.to(x.dtype)
+        v_w_eff = _apply_training_weight_quant(v_w, x.dtype) if self.training else v_w.to(x.dtype)
+        out_w_eff = _apply_training_weight_quant(out_w, x.dtype) if self.training else out_w.to(x.dtype)
+        q = F.linear(x, q_w_eff).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = F.linear(x, k_w_eff).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(x, v_w_eff)
         if v_embed is not None:
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -686,7 +790,7 @@ class CausalSelfAttention(nn.Module):
             gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
             y = y * gate
         y = y.reshape(bsz, seqlen, dim)
-        return F.linear(y, out_w.to(x.dtype)), raw_v
+        return F.linear(y, out_w_eff), raw_v
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
@@ -753,8 +857,10 @@ class MLP(nn.Module):
         super().__init__()
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+        up_w_eff = _apply_training_weight_quant(up_w, x.dtype) if self.training else up_w.to(x.dtype)
+        down_w_eff = _apply_training_weight_quant(down_w, x.dtype) if self.training else down_w.to(x.dtype)
+        x = F.leaky_relu(F.linear(x, up_w_eff), negative_slope=0.5)
+        return F.linear(x.square(), down_w_eff)
 
 class Block(nn.Module):
     def __init__(
@@ -1572,6 +1678,8 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
 def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    _validate_qat_config(args)
+    args.runtime_late_qat_threshold = _resolved_runtime_late_qat_threshold(args)
     # zeropower_via_newtonschulz5 runs eagerly with bmm -- do NOT compile
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1642,7 +1750,18 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        "qat_config:"
+        f" mode={_resolved_qat_mode(args)}"
+        f" qat_bits={args.qat_bits}"
+        f" qat_onset_scale={args.qat_onset_scale:.4f}"
+        f" late_qat_threshold={args.runtime_late_qat_threshold:.4f}"
+        f" qat_block_size={args.qat_block_size}"
+    )
     CastedLinear._qat_enabled = args.qat_enabled
+    _QATRuntime.enabled = args.qat_enabled
+    _QATRuntime.bits = args.qat_bits
+    _QATRuntime.block_size = args.qat_block_size
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1862,9 +1981,10 @@ def main() -> None:
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
+        if args.runtime_late_qat_threshold > 0 and scale < args.runtime_late_qat_threshold and not _QATRuntime.enabled:
             CastedLinear._qat_enabled = True
-            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+            _QATRuntime.enabled = True
+            log0(f"late_qat:enabled step:{step} scale:{scale:.4f} mode:{_resolved_qat_mode(args)}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
