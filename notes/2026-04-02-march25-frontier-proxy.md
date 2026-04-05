@@ -454,3 +454,83 @@ If the 3-seed no-QAT mean still sits around the current local plateau, the right
 
 - the int4 QAT ablation
 - later artifact-headroom or scale-up work if int4 earns it
+
+## April 5 Handoff Read
+
+Two more runs closed out the `seed=999` question:
+
+- `slurm/output/pg-march25-frontier-4gpu-54869.out` — `seed=999`, no-QAT, default `temp=0.8`
+- `slurm/output/pg-march25-frontier-4gpu-54870.out` — `seed=999`, no-QAT, `GPTQ_AR_CALIB_TEMP=0.9`
+
+### Result read
+
+#### 1. `54869` should not be treated as the final 3-seed bookkeeping run
+
+`54869` only reached `6840` steps with average step time `986.92 ms/step`, then finished at:
+
+- float sliding `1.11370639`
+- int6 sliding `1.11714673`
+
+That is a useful sanity datapoint, but it is still slower than the clean matched-proxy runs and should be treated as runtime-contaminated rather than as the canonical `seed=999`, `temp=0.8` control.
+
+#### 2. `54870` says `temp=0.9` is still optional, not promoted
+
+`54870` reached a clean-enough `6915` steps and landed at:
+
+- float sliding `1.11298322`
+- int6 sliding `1.11677359`
+- size `16,002,858`
+
+Compared with the stronger clean seed-314 result `54866` (`1.11587877`) and the clean seed-42 no-QAT result `54857` (`1.11617889`), this does not suggest a hidden broad win from `temp=0.9`. It looks like seed-level noise plus a small, inconsistent export tweak.
+
+#### 3. The phase transition is now more important than more March 25 churn
+
+At this point the working interpretation is:
+
+- freeze the no-QAT March 25 parity base
+- rerun `seed=999`, `temp=0.8` only if we want strict 3-seed bookkeeping
+- stop doing broad March 25 micro-sweeps
+- move the main effort to the int4-QAT ablation on this exact frozen stack
+
+### Next-phase plan
+
+#### Main lane: int4 QAT on the frozen parity base
+
+Use the frozen matched-proxy settings:
+
+- `H100_PROXY=1`
+- `H100_EQUIV_MULTIPLIER=11.25`
+- `LATE_QAT_THRESHOLD=0`
+- `GPTQ_AR_CALIB_TEMP=0.8` as the default export setting
+
+Then start with a narrow seed-314 matrix:
+
+1. control on the frozen no-QAT base
+2. int4 QAT with onset `0.15`
+3. int4 QAT with onset `0.20`
+
+This is the shortest path to learning whether the new idea actually buys BPB or artifact headroom on the real parity stack.
+
+#### Sidecar lane: local pairwise alignment on the export path
+
+If we want one fresh non-int4 idea in parallel, the best fit is still export-side rather than architecture-side.
+
+Candidate direction:
+
+- a lightweight local pairwise-alignment / PolarQuant-like preconditioner before GPTQ Hessian collection or solve
+
+Reason:
+
+- the clean March 25 runs still pay roughly `0.0039` to `0.0041` BPB from float sliding to int6 sliding
+- recent rotation/alignment work like PolarQuant and CAT makes this look more plausible than another architecture retune on this stack
+- it is cheap to scope as an export-only sidecar without destabilizing the training recipe
+
+Suggested first implementation shape:
+
+- start with block-local channel pairing from calibration covariance or activation correlation
+- apply a simple orthogonal pairwise rotation inside each block before GPTQ statistics collection
+- keep the first pass artifact-neutral and easy to ablate against the frozen no-QAT export path
+
+Success bar:
+
+- keep it only if it wins at least `0.0003` BPB on quantized sliding eval, or clearly improves int4/export headroom

@@ -83,6 +83,10 @@ Decision: keep the beginner-oriented top-level trainer mostly stable. Competitiv
   - overlapping rerun `54865` only reached `5953` steps and should be treated as runtime-contaminated, not as a recipe datapoint
   - calibration-seed checks were not promising: clean `54868` (`GPTQ_AR_CALIB_SEED=42`) regressed to int6 sliding `1.11628764`, while `54867` was both slower and worse
   - final March 25 read: freeze the local parity base at `H100_EQUIV_MULTIPLIER=11.25` and `LATE_QAT_THRESHOLD=0`; treat `GPTQ_AR_CALIB_TEMP=0.9` as optional, but stop broader export and legacy late-QAT sweeps
+- [x] Seed-999 follow-up probed the frozen no-QAT base (pg-march25-frontier-4gpu-54869/54870, completed 2026-04-04)
+  - default-temp control `54869` (`seed=999`, no-QAT, `temp=0.8`) only reached `6840` steps and should be treated as runtime-contaminated rather than as the final 3-seed control
+  - optional-sidecar run `54870` (`seed=999`, no-QAT, `temp=0.9`) reached `6915` steps and landed at float sliding `1.11298322` | int6 sliding `1.11677359` | size `16,002,858`
+  - read: seed `999` did not reveal a hidden big gain from export tuning; one clean `seed=999`, `temp=0.8` rerun is still useful for strict bookkeeping, but it should not block the int4 phase
 - [ ] Pre-TTT parity check against the March 25 no-TTT stack
 - [ ] Int4-QAT ablation on the parity stack
 - [ ] Int4 export / larger-model follow-up if int4 QAT shows value
@@ -142,6 +146,17 @@ Experiment matrix:
 
 Checkpoint: int4 QAT should either improve mean pre-TTT BPB by at least 0.0005 across 3 seeds or materially improve artifact budget enough to justify a scale-up follow-up.
 
+### Phase 2.5 - Export-Side Alignment Sidecar
+
+Only pursue this in parallel with Phase 2 if the implementation stays cheap and bounded to the export path.
+
+- start from the frozen March 25 no-QAT base rather than reopening broad training-side sweeps
+- test a lightweight local pairwise-alignment / PolarQuant-like preconditioner before GPTQ Hessian collection or quantization
+- likely first versions: pairwise channel rotations inside a block, blockwise Hadamard plus pairwise refinement, or calibration-driven pairing from activation covariance
+- keep the first pass artifact-neutral and code-light; treat it as an export-side sidecar, not a new architecture
+
+Checkpoint: keep this branch only if it improves quantized sliding BPB by at least `0.0003` at similar artifact size, or clearly creates new headroom for later int4 export.
+
 ### Phase 3 - Int4 Export And Larger Models
 
 Only proceed if Phase 2 is promising.
@@ -183,8 +198,9 @@ These are worth tracking, but they should not preempt March 25 parity:
 
 ## Near-Term Next Steps
 
-1. Freeze the March 25 local proxy baseline at `H100_EQUIV_MULTIPLIER=11.25` with `LATE_QAT_THRESHOLD=0`; use `GPTQ_AR_CALIB_TEMP=0.8` as the conservative default and treat `0.9` as optional rather than promoted
-2. Finish the local matched-proxy control as a real 3-seed no-QAT baseline by adding `seed=999`
+1. Keep the March 25 local proxy baseline frozen at `H100_EQUIV_MULTIPLIER=11.25` with `LATE_QAT_THRESHOLD=0`; use `GPTQ_AR_CALIB_TEMP=0.8` as the conservative default and treat `0.9` as optional rather than promoted
+2. If we want strict 3-seed bookkeeping, rerun one clean `seed=999`, `LATE_QAT_THRESHOLD=0`, `GPTQ_AR_CALIB_TEMP=0.8` control; do not let this block the phase transition
 3. Port int4 late-onset Hadamard / trust-gradient QAT onto that exact frozen no-QAT stack before doing any more broad March 25 micro-sweeps
 4. Start the int4 check with a narrow seed-314 matrix: control, onset `0.15`, and onset `0.20`
-5. Do not spend more time on legacy late-QAT onset sweeps, `GPTQ_AR_CALIB_SEQS > 64`, or calibration-seed sweeps unless the int4 work specifically exposes a new export bottleneck
+5. Keep at most one export-side sidecar alive during the int4 port: a local pairwise-alignment / PolarQuant-like preconditioner on the frozen no-QAT export path
+6. Do not spend more time on legacy late-QAT onset sweeps, `GPTQ_AR_CALIB_SEQS > 64`, or calibration-seed sweeps unless the int4 or alignment work specifically exposes a new export bottleneck
