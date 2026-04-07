@@ -12,6 +12,8 @@ data/docs_selected.source_manifest.json
 .conda/
 logs/
 remote-logs/
+.playwright-cli/
+.playwright-mcp/
 .env.runpod
 final_model.pt
 final_model.int8.ptz
